@@ -12,7 +12,8 @@ import json
 # ============ 配置 ============
 NEW_API_URL = os.getenv("NEW_API_URL", "https://velvenode.zeabur.app")
 COUPON_SITE_URL = os.getenv("COUPON_SITE_URL", "https://velvenodehome.zeabur.app")
-DATA_DIR = "/app/data" if os.path.exists("/app/data") else "."
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)  # 确保目录存在
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR}/coupon.db")
 SITE_NAME = os.getenv("SITE_NAME", "velvenode")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
@@ -1373,4 +1374,5 @@ WIDGET_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
