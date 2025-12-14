@@ -13,6 +13,10 @@ import json
 NEW_API_URL = os.getenv("NEW_API_URL", "https://velvenode.zeabur.app")
 COUPON_SITE_URL = os.getenv("COUPON_SITE_URL", "https://velvenodehome.zeabur.app")
 
+# 时区配置：默认 UTC+8（中国时区）
+TIMEZONE_OFFSET_HOURS = int(os.getenv("TIMEZONE_OFFSET_HOURS", "8"))
+APP_TIMEZONE = timezone(timedelta(hours=TIMEZONE_OFFSET_HOURS))
+
 # 持久化数据目录
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -49,6 +53,8 @@ class ClaimRecord(Base):
     coupon_code = Column(String(64), nullable=False)
     quota_dollars = Column(Float, default=1.0)
     claim_time = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # 新增：记录该次领取时的冷却结束时间
+    cooldown_expires_at = Column(DateTime, nullable=True)
 
 class SystemConfig(Base):
     __tablename__ = "system_config"
@@ -61,12 +67,51 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} i
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
+# 自动迁移：添加缺失的数据库字段
+def auto_migrate():
+    """自动添加缺失的数据库字段"""
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        try:
+            result = conn.execute(text("PRAGMA table_info(claim_records)"))
+            columns = [row[1] for row in result]
+            
+            if 'cooldown_expires_at' not in columns:
+                conn.execute(text("ALTER TABLE claim_records ADD COLUMN cooldown_expires_at DATETIME"))
+                conn.commit()
+                print("✅ 已自动添加 cooldown_expires_at 字段")
+        except Exception as e:
+            print(f"迁移检查: {e}")
+
+auto_migrate()
+
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+# ============ 时间工具函数 ============
+def now_utc():
+    """获取当前 UTC 时间"""
+    return datetime.now(timezone.utc)
+
+def ensure_utc(dt: datetime) -> datetime:
+    """确保 datetime 有 UTC 时区信息"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def format_local_time(dt: datetime) -> str:
+    """将 UTC 时间转换为本地时间并格式化"""
+    if dt is None:
+        return ""
+    dt_utc = ensure_utc(dt)
+    dt_local = dt_utc.astimezone(APP_TIMEZONE)
+    return dt_local.strftime("%Y-%m-%d %H:%M:%S")
 
 # ============ 配置管理函数 ============
 def get_config(db: Session, key: str, default=None):
@@ -79,7 +124,7 @@ def set_config(db: Session, key: str, value: str):
     config = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
     if config:
         config.config_value = value
-        config.updated_at = datetime.now(timezone.utc)
+        config.updated_at = now_utc()
     else:
         config = SystemConfig(config_key=key, config_value=value)
         db.add(config)
@@ -127,9 +172,6 @@ with SessionLocal() as db:
 app = FastAPI(title="兑换券系统")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
 # ============ 用户验证函数 ============
 async def verify_user_identity(user_id: int, username: str, api_key: str) -> bool:
     try:
@@ -171,7 +213,6 @@ def get_random_coupon(db: Session):
         quota_str = str(quota)
         weight = None
         
-        # 尝试多种格式匹配
         for key in [quota_str, str(int(quota)) if quota == int(quota) else None]:
             if key and key in quota_weights:
                 weight = float(quota_weights[key])
@@ -198,6 +239,73 @@ def format_cooldown(minutes: int) -> str:
             return f"{h}小时{m}分钟"
         return f"{h}小时"
     return f"{minutes}分钟"
+
+def calculate_user_cooldown_status(db: Session, user_id: int, now: datetime):
+    """
+    计算用户的冷却状态
+    
+    返回: (can_claim, remaining_claims, cooldown_seconds, recent_claims)
+    
+    逻辑：
+    1. 获取用户最近的领取记录
+    2. 对于每条记录，计算两个可能的冷却结束时间：
+       a. 记录中存储的 cooldown_expires_at（如果存在）
+       b. claim_time + 当前配置的 cooldown_minutes
+    3. 取两者中的较小值作为实际冷却结束时间
+    4. 这样：如果管理员缩短冷却时间，用户立即受益；如果延长，不影响已有记录
+    """
+    cooldown_minutes = get_cooldown_minutes(db)
+    claim_times = get_claim_times(db)
+    
+    # 获取用户所有可能在冷却期内的记录（取最大可能范围）
+    # 使用较大的时间窗口来获取记录，然后在代码中精确计算
+    max_lookback = now - timedelta(minutes=cooldown_minutes * 2)  # 2倍冷却时间作为安全边界
+    
+    recent_claims = db.query(ClaimRecord).filter(
+        ClaimRecord.user_id == user_id,
+        ClaimRecord.claim_time >= max_lookback
+    ).order_by(ClaimRecord.claim_time.desc()).all()
+    
+    # 计算哪些记录仍在冷却期内
+    active_claims = []
+    for claim in recent_claims:
+        claim_time = ensure_utc(claim.claim_time)
+        
+        # 方案1：使用当前配置计算的冷却结束时间
+        config_expires = claim_time + timedelta(minutes=cooldown_minutes)
+        
+        # 方案2：使用记录中存储的冷却结束时间（如果存在）
+        stored_expires = ensure_utc(claim.cooldown_expires_at) if claim.cooldown_expires_at else None
+        
+        # 取较小值（对用户更有利）
+        if stored_expires:
+            actual_expires = min(config_expires, stored_expires)
+        else:
+            actual_expires = config_expires
+        
+        # 如果还在冷却期内，加入活跃列表
+        if now < actual_expires:
+            active_claims.append({
+                'claim': claim,
+                'expires_at': actual_expires
+            })
+    
+    claims_in_period = len(active_claims)
+    remaining_claims = max(0, claim_times - claims_in_period)
+    
+    can_claim = True
+    cooldown_seconds = 0
+    
+    if claims_in_period >= claim_times and active_claims:
+        # 找到最早过期的那条记录
+        earliest_expiry = min(c['expires_at'] for c in active_claims)
+        
+        if now < earliest_expiry:
+            can_claim = False
+            remaining_delta = earliest_expiry - now
+            cooldown_seconds = int(remaining_delta.total_seconds())
+    
+    return can_claim, remaining_claims, cooldown_seconds, recent_claims
 
 # ============ 用户 API ============
 @app.post("/api/verify")
@@ -236,40 +344,20 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
     if not await verify_user_identity(user_id, username, api_key):
         raise HTTPException(status_code=401, detail="API Key 无效")
     
-    cooldown_minutes = get_cooldown_minutes(db)
     claim_times = get_claim_times(db)
     now = now_utc()
     
-    # 获取冷却周期内的领取记录
-    cooldown_start = now - timedelta(minutes=cooldown_minutes)
-    recent_claims = db.query(ClaimRecord).filter(
-        ClaimRecord.user_id == user_id,
-        ClaimRecord.claim_time >= cooldown_start
-    ).order_by(ClaimRecord.claim_time.desc()).all()
+    can_claim, remaining_claims, cooldown_seconds, _ = calculate_user_cooldown_status(db, user_id, now)
     
-    claims_in_period = len(recent_claims)
-    remaining_claims = max(0, claim_times - claims_in_period)
-    
-    can_claim = True
     cooldown_text = None
-    
-    if claims_in_period >= claim_times and recent_claims:
-        # 已用完本周期次数，计算下次可领取时间
-        oldest_claim = recent_claims[-1]
-        oldest_time = oldest_claim.claim_time.replace(tzinfo=timezone.utc) if oldest_claim.claim_time.tzinfo is None else oldest_claim.claim_time
-        next_claim_time = oldest_time + timedelta(minutes=cooldown_minutes)
-        
-        if now < next_claim_time:
-            can_claim = False
-            remaining = next_claim_time - now
-            total_seconds = int(remaining.total_seconds())
-            h = total_seconds // 3600
-            m = (total_seconds % 3600) // 60
-            s = total_seconds % 60
-            if h > 0:
-                cooldown_text = f"{h}小时 {m}分钟 {s}秒"
-            else:
-                cooldown_text = f"{m}分钟 {s}秒"
+    if not can_claim and cooldown_seconds > 0:
+        h = cooldown_seconds // 3600
+        m = (cooldown_seconds % 3600) // 60
+        s = cooldown_seconds % 60
+        if h > 0:
+            cooldown_text = f"{h}小时 {m}分钟 {s}秒"
+        else:
+            cooldown_text = f"{m}分钟 {s}秒"
     
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     if available == 0:
@@ -290,7 +378,7 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
                 {
                     "coupon_code": r.coupon_code,
                     "quota": r.quota_dollars,
-                    "claim_time": r.claim_time.isoformat()
+                    "claim_time": r.claim_time.isoformat() if r.claim_time else ""
                 } for r in history
             ]
         }
@@ -317,27 +405,16 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     claim_times = get_claim_times(db)
     now = now_utc()
     
-    # 检查冷却周期内的领取次数
-    cooldown_start = now - timedelta(minutes=cooldown_minutes)
-    recent_claims = db.query(ClaimRecord).filter(
-        ClaimRecord.user_id == user_id,
-        ClaimRecord.claim_time >= cooldown_start
-    ).order_by(ClaimRecord.claim_time.desc()).all()
+    can_claim, remaining_claims, cooldown_seconds, _ = calculate_user_cooldown_status(db, user_id, now)
     
-    if len(recent_claims) >= claim_times:
-        oldest_claim = recent_claims[-1]
-        oldest_time = oldest_claim.claim_time.replace(tzinfo=timezone.utc) if oldest_claim.claim_time.tzinfo is None else oldest_claim.claim_time
-        next_claim_time = oldest_time + timedelta(minutes=cooldown_minutes)
-        
-        if now < next_claim_time:
-            remaining = next_claim_time - now
-            total_min = int(remaining.total_seconds()) // 60
-            if total_min >= 60:
-                h = total_min // 60
-                m = total_min % 60
-                raise HTTPException(status_code=400, detail=f"冷却中，请在 {h}小时 {m}分钟 后再试")
-            else:
-                raise HTTPException(status_code=400, detail=f"冷却中，请在 {total_min}分钟 后再试")
+    if not can_claim:
+        total_min = cooldown_seconds // 60
+        if total_min >= 60:
+            h = total_min // 60
+            m = total_min % 60
+            raise HTTPException(status_code=400, detail=f"冷却中，请在 {h}小时 {m}分钟 后再试")
+        else:
+            raise HTTPException(status_code=400, detail=f"冷却中，请在 {total_min}分钟 后再试")
     
     coupon = get_random_coupon(db)
     if not coupon:
@@ -348,20 +425,24 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     coupon.claimed_by_username = username
     coupon.claimed_at = now
     
+    # 计算并存储冷却结束时间
+    cooldown_expires = now + timedelta(minutes=cooldown_minutes)
+    
     record = ClaimRecord(
         user_id=user_id,
         username=username,
         coupon_code=coupon.coupon_code,
         quota_dollars=coupon.quota_dollars,
-        claim_time=now
+        claim_time=now,
+        cooldown_expires_at=cooldown_expires  # 存储冷却结束时间
     )
     db.add(record)
     db.commit()
     
-    # 返回剩余次数
-    remaining = claim_times - len(recent_claims) - 1
+    # 返回剩余次数（领取后减1）
+    new_remaining = remaining_claims - 1
     
-    return {"success": True, "data": {"coupon_code": coupon.coupon_code, "quota": coupon.quota_dollars, "remaining_claims": remaining}}
+    return {"success": True, "data": {"coupon_code": coupon.coupon_code, "quota": coupon.quota_dollars, "remaining_claims": new_remaining}}
 
 # ============ 管理员 API ============
 @app.post("/api/admin/login")
@@ -421,13 +502,11 @@ async def get_coupons(password: str, page: int = 1, per_page: int = 20, status: 
     
     query = db.query(CouponPool)
     
-    # 状态筛选
     if status == "available":
         query = query.filter(CouponPool.is_claimed == False)
     elif status == "claimed":
         query = query.filter(CouponPool.is_claimed == True)
     
-    # 搜索
     if search:
         query = query.filter(CouponPool.coupon_code.contains(search))
     
@@ -448,8 +527,8 @@ async def get_coupons(password: str, page: int = 1, per_page: int = 20, status: 
                     "quota": c.quota_dollars,
                     "is_claimed": c.is_claimed,
                     "claimed_by": c.claimed_by_username,
-                    "claimed_at": c.claimed_at.strftime("%Y-%m-%d %H:%M") if c.claimed_at else None,
-                    "created_at": c.created_at.strftime("%Y-%m-%d %H:%M") if c.created_at else None
+                    "claimed_at": format_local_time(c.claimed_at) if c.claimed_at else None,
+                    "created_at": format_local_time(c.created_at) if c.created_at else None
                 } for c in coupons
             ]
         }
@@ -480,7 +559,7 @@ async def delete_coupons_batch(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
     password = body.get("password", "")
     ids = body.get("ids", [])
-    delete_type = body.get("type", "selected")  # selected, all_available, all_claimed, all
+    delete_type = body.get("type", "selected")
     
     if password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
@@ -559,13 +638,14 @@ async def get_stats(password: str, db: Session = Depends(get_db)):
             "cooldown_minutes": cooldown_minutes,
             "claim_times": claim_times,
             "quota_weights": quota_weights,
+            "timezone_offset": TIMEZONE_OFFSET_HOURS,
             "recent_claims": [
                 {
                     "user_id": r.user_id,
                     "username": r.username,
                     "quota": r.quota_dollars,
                     "code": r.coupon_code[:8] + "...",
-                    "time": r.claim_time.strftime("%m-%d %H:%M") if r.claim_time else ""
+                    "time": format_local_time(r.claim_time)
                 } for r in recent
             ]
         }
@@ -1253,6 +1333,11 @@ ADMIN_PAGE = '''<!DOCTYPE html>
                                 </div>
                                 <p class="text-xs text-gray-500 mt-1">用户在冷却时间内可领取的次数</p>
                             </div>
+                            <div class="bg-yellow-900/20 border border-yellow-800 rounded p-3 text-sm text-yellow-400">
+                                <p>💡 <b>冷却时间调整说明：</b></p>
+                                <p class="mt-1 text-yellow-500">• 缩短冷却时间：用户立即受益，冷却时间减少</p>
+                                <p class="text-yellow-500">• 延长冷却时间：不影响已有用户的冷却，只对新领取生效</p>
+                            </div>
                             <button class="btn btn-blue w-full" onclick="saveCooldownConfig()">保存冷却配置</button>
                         </div>
                     </div>
@@ -1570,9 +1655,11 @@ ADMIN_PAGE = '''<!DOCTYPE html>
                         h += '<div class="bg-blue-900/30 p-4 rounded-lg text-center border border-blue-800"><div class="text-2xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-gray-500 text-sm">已领</div></div>';
                         h += '</div>';
                         
-                        h += '<div class="grid grid-cols-2 gap-4 mb-6">';
+                        var tzText = d.timezone_offset >= 0 ? 'UTC+' + d.timezone_offset : 'UTC' + d.timezone_offset;
+                        h += '<div class="grid grid-cols-3 gap-4 mb-6">';
                         h += '<div class="bg-purple-900/30 p-3 rounded-lg border border-purple-800"><span class="text-purple-400">⏱️ 冷却时间: '+cooldownText+'</span></div>';
                         h += '<div class="bg-orange-900/30 p-3 rounded-lg border border-orange-800"><span class="text-orange-400">🎯 每周期可领: '+d.claim_times+'次</span></div>';
+                        h += '<div class="bg-cyan-900/30 p-3 rounded-lg border border-cyan-800"><span class="text-cyan-400">🌍 时区: '+tzText+'</span></div>';
                         h += '</div>';
                         
                         h += '<div class="space-y-2">';
@@ -1647,4 +1734,3 @@ WIDGET_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
