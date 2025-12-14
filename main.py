@@ -1,12 +1,12 @@
-from fastapi import FastAPI, HTTPException, Request, Depends, Form
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime, timedelta
 from typing import Optional
 import httpx
+import hashlib
 import os
 
 # ============ 配置 ============
@@ -24,7 +24,7 @@ Base = declarative_base()
 class ClaimRecord(Base):
     __tablename__ = "claim_records"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, index=True, nullable=False)
+    user_key_hash = Column(String(64), index=True, nullable=False)  # API Key 的哈希，用于标识用户
     username = Column(String(255), nullable=False)
     coupon_code = Column(String(64), unique=True, nullable=False)
     quota = Column(Integer, default=500000)
@@ -54,27 +54,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============ 验证 API Key ============
-async def verify_api_key(api_key: str) -> Optional[dict]:
-    if not api_key:
-        return None
+# ============ 工具函数 ============
+def hash_api_key(api_key: str) -> str:
+    """对 API Key 进行哈希，用于标识用户"""
+    return hashlib.sha256(api_key.encode()).hexdigest()[:32]
+
+async def verify_api_key(api_key: str) -> bool:
+    """通过调用模型列表接口验证 API Key 是否有效"""
+    if not api_key or not api_key.startswith("sk-"):
+        return False
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"{NEW_API_URL}/api/user/self",
+                f"{NEW_API_URL}/v1/models",
                 headers={"Authorization": f"Bearer {api_key}"}
             )
             if resp.status_code == 200:
                 data = resp.json()
-                if data.get("success"):
-                    return data.get("data")
+                return data.get("success", False) or "data" in data
     except Exception as e:
         print(f"API Key verify error: {e}")
-    return None
+    return False
 
-# ============ 创建兑换码 ============
 async def create_redemption_code(name: str, quota: int) -> Optional[str]:
+    """在 New API 创建兑换码"""
     if not NEW_API_ADMIN_TOKEN:
+        print("Error: NEW_API_ADMIN_TOKEN not configured")
         return None
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -86,6 +91,7 @@ async def create_redemption_code(name: str, quota: int) -> Optional[str]:
                 },
                 json={"name": name, "quota": quota, "count": 1}
             )
+            print(f"Create redemption: {resp.status_code} - {resp.text}")
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("success") and data.get("data"):
@@ -99,26 +105,46 @@ async def create_redemption_code(name: str, quota: int) -> Optional[str]:
 # ============ API ============
 @app.post("/api/verify")
 async def verify_user(request: Request):
+    """验证 API Key"""
     body = await request.json()
-    api_key = body.get("api_key", "")
-    user = await verify_api_key(api_key)
-    if not user:
-        raise HTTPException(status_code=401, detail="API Key 无效")
-    return {"success": True, "data": user}
+    api_key = body.get("api_key", "").strip()
+    
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请输入 API Key")
+    
+    is_valid = await verify_api_key(api_key)
+    if not is_valid:
+        raise HTTPException(status_code=401, detail="API Key 无效或已过期")
+    
+    # 返回 Key 的哈希作为用户标识
+    key_hash = hash_api_key(api_key)
+    return {
+        "success": True,
+        "data": {
+            "key_hash": key_hash,
+            "key_preview": api_key[:10] + "****" + api_key[-4:]
+        }
+    }
 
 @app.post("/api/claim/status")
 async def get_claim_status(request: Request, db: Session = Depends(get_db)):
+    """获取领取状态"""
     body = await request.json()
-    api_key = body.get("api_key", "")
-    user = await verify_api_key(api_key)
-    if not user:
-        raise HTTPException(status_code=401, detail="API Key 无效")
+    api_key = body.get("api_key", "").strip()
     
-    user_id = user.get("id")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请输入 API Key")
+    
+    is_valid = await verify_api_key(api_key)
+    if not is_valid:
+        raise HTTPException(status_code=401, detail="API Key 无效或已过期")
+    
+    key_hash = hash_api_key(api_key)
     now = datetime.utcnow()
     
+    # 查询该 Key 的最近领取记录
     last_claim = db.query(ClaimRecord).filter(
-        ClaimRecord.user_id == user_id
+        ClaimRecord.user_key_hash == key_hash
     ).order_by(ClaimRecord.claim_time.desc()).first()
     
     can_claim = True
@@ -135,8 +161,9 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
             seconds = total_seconds % 60
             cooldown_text = f"{hours}小时 {minutes}分钟 {seconds}秒"
     
+    # 获取历史记录
     history = db.query(ClaimRecord).filter(
-        ClaimRecord.user_id == user_id
+        ClaimRecord.user_key_hash == key_hash
     ).order_by(ClaimRecord.claim_time.desc()).limit(10).all()
     
     return {
@@ -157,18 +184,23 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/api/claim")
 async def claim_coupon(request: Request, db: Session = Depends(get_db)):
+    """领取兑换券"""
     body = await request.json()
-    api_key = body.get("api_key", "")
-    user = await verify_api_key(api_key)
-    if not user:
-        raise HTTPException(status_code=401, detail="API Key 无效")
+    api_key = body.get("api_key", "").strip()
     
-    user_id = user.get("id")
-    username = user.get("username", "unknown")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请输入 API Key")
+    
+    is_valid = await verify_api_key(api_key)
+    if not is_valid:
+        raise HTTPException(status_code=401, detail="API Key 无效或已过期")
+    
+    key_hash = hash_api_key(api_key)
     now = datetime.utcnow()
     
+    # 检查冷却
     last_claim = db.query(ClaimRecord).filter(
-        ClaimRecord.user_id == user_id
+        ClaimRecord.user_key_hash == key_hash
     ).order_by(ClaimRecord.claim_time.desc()).first()
     
     if last_claim:
@@ -180,16 +212,18 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
             minutes = (total_seconds % 3600) // 60
             raise HTTPException(status_code=400, detail=f"冷却中，请在 {hours}小时 {minutes}分钟 后再试")
     
-    code_name = f"{COUPON_NAME_PREFIX}-{user_id}-{now.strftime('%Y%m%d%H%M%S')}"
+    # 生成兑换码
+    code_name = f"{COUPON_NAME_PREFIX}-{key_hash[:8]}-{now.strftime('%m%d%H%M%S')}"
     coupon_code = await create_redemption_code(code_name, COUPON_QUOTA)
     
     if not coupon_code:
-        raise HTTPException(status_code=500, detail="创建兑换码失败，请联系管理员检查 NEW_API_ADMIN_TOKEN 配置")
+        raise HTTPException(status_code=500, detail="创建兑换码失败，请联系管理员")
     
+    # 记录
     expire_time = now + timedelta(hours=24)
     record = ClaimRecord(
-        user_id=user_id,
-        username=username,
+        user_key_hash=key_hash,
+        username=api_key[:10] + "****",
         coupon_code=coupon_code,
         quota=COUPON_QUOTA,
         claim_time=now,
@@ -252,7 +286,7 @@ async def index():
                            class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                            placeholder="sk-xxxxxxxxxxxxxxxx">
                     <p class="text-xs text-gray-400 mt-2">
-                        在 <a href="{NEW_API_URL}/token" target="_blank" class="text-blue-500 hover:underline">主站令牌管理</a> 中获取
+                        💡 在 <a href="{NEW_API_URL}/console/token" target="_blank" class="text-blue-500 hover:underline">主站控制台 → 令牌管理</a> 中创建
                     </p>
                 </div>
                 <button onclick="verifyKey()" id="verify-btn"
@@ -267,10 +301,10 @@ async def index():
             <div class="card p-6 mb-6">
                 <div class="flex items-center justify-between mb-4">
                     <div>
-                        <p class="text-gray-500 text-sm">当前用户</p>
-                        <p id="user-info" class="font-semibold text-gray-800"></p>
+                        <p class="text-gray-500 text-sm">当前 API Key</p>
+                        <p id="key-preview" class="font-mono text-gray-800"></p>
                     </div>
-                    <button onclick="logout()" class="text-gray-400 hover:text-gray-600">退出</button>
+                    <button onclick="logout()" class="text-gray-400 hover:text-gray-600 text-sm">切换账号</button>
                 </div>
             </div>
 
@@ -285,7 +319,7 @@ async def index():
                         ⬇️ 领取兑换券
                     </button>
                     <p id="cooldown-msg" class="text-gray-500 mt-4"></p>
-                    <p class="text-gray-400 text-sm mt-2">每 {CLAIM_COOLDOWN_HOURS} 小时可领取一次</p>
+                    <p class="text-gray-400 text-sm mt-2">每 {CLAIM_COOLDOWN_HOURS} 小时可领取一次 · 每次 {COUPON_QUOTA//500000} 美元额度</p>
                 </div>
             </div>
 
@@ -299,7 +333,7 @@ async def index():
                 <ol class="list-decimal list-inside space-y-2 text-gray-600 text-sm">
                     <li>点击"领取兑换券"获取兑换码</li>
                     <li>复制兑换码</li>
-                    <li>前往 <a href="{NEW_API_URL}/topup" target="_blank" class="text-blue-500 hover:underline">主站充值页面</a></li>
+                    <li>前往 <a href="{NEW_API_URL}/topup" target="_blank" class="text-blue-500 hover:underline">主站钱包管理</a></li>
                     <li>在"兑换码充值"处粘贴并兑换</li>
                 </ol>
             </div>
@@ -310,7 +344,7 @@ async def index():
 
     <script>
         let apiKey = localStorage.getItem('coupon_api_key') || '';
-        let currentUser = null;
+        let keyPreview = '';
 
         document.addEventListener('DOMContentLoaded', () => {{
             if (apiKey) {{
@@ -349,7 +383,7 @@ async def index():
                 const data = await resp.json();
                 
                 if (resp.ok && data.success) {{
-                    currentUser = data.data;
+                    keyPreview = data.data.key_preview;
                     localStorage.setItem('coupon_api_key', apiKey);
                     showLoggedIn();
                     await loadStatus();
@@ -367,14 +401,12 @@ async def index():
         function showLoggedIn() {{
             document.getElementById('login-section').classList.add('hidden');
             document.getElementById('claim-section').classList.remove('hidden');
-            document.getElementById('user-info').textContent = 
-                `${{currentUser.display_name || currentUser.username}} (ID: ${{currentUser.id}})`;
+            document.getElementById('key-preview').textContent = keyPreview;
         }}
 
         function logout() {{
             localStorage.removeItem('coupon_api_key');
             apiKey = '';
-            currentUser = null;
             document.getElementById('api-key-input').value = '';
             document.getElementById('login-section').classList.remove('hidden');
             document.getElementById('claim-section').classList.add('hidden');
@@ -446,9 +478,8 @@ async def index():
                 const data = await resp.json();
                 
                 if (resp.ok && data.success) {{
-                    showToast('领取成功！');
+                    showToast('领取成功！已复制到剪贴板');
                     await navigator.clipboard.writeText(data.data.coupon_code);
-                    showToast('已复制到剪贴板');
                 }} else {{
                     showToast(data.detail || '领取失败', false);
                 }}
