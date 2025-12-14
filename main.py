@@ -351,114 +351,32 @@ HOME_PAGE = '''<!DOCTYPE html>
     <title>{{SITE_NAME}} - 统一的大模型API网关</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        :root {
-            --bg-primary: #0a0a0f;
-            --bg-card: #12121a;
-            --border: #1f1f2e;
-            --accent: #3b82f6;
-            --text: #e0e0e0;
-            --muted: #6b7280;
-        }
-        body {
-            background: var(--bg-primary);
-            color: var(--text);
-            font-family: system-ui, -apple-system, sans-serif;
-        }
-        .card {
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-        }
-        .btn {
-            padding: 10px 20px;
-            border-radius: 8px;
-            font-weight: 500;
-            transition: all 0.2s;
-            text-decoration: none;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            cursor: pointer;
-            border: none;
-        }
-        .btn-primary {
-            background: var(--accent);
-            color: #fff;
-        }
-        .btn-primary:hover {
-            background: #2563eb;
-        }
-        .btn-secondary {
-            background: #1f1f2e;
-            color: var(--text);
-            border: 1px solid #2a2a3a;
-        }
-        .btn-secondary:hover {
-            background: #2a2a3a;
-        }
-        .code-box {
-            background: #0d0d12;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 14px 18px;
-            font-family: ui-monospace, monospace;
-        }
-        .glow {
-            box-shadow: 0 0 40px rgba(59, 130, 246, 0.15);
-        }
-        /* 接口轮播动画 */
-        .endpoint-container {
-            height: 24px;
-            overflow: hidden;
-            display: inline-block;
-        }
-        .endpoint-slider {
-            animation: slideEndpoints 12s infinite;
-        }
-        .endpoint-item {
-            height: 24px;
-            line-height: 24px;
-        }
-        @keyframes slideEndpoints {
-            0%, 16% { transform: translateY(0); }
-            20%, 36% { transform: translateY(-24px); }
-            40%, 56% { transform: translateY(-48px); }
-            60%, 76% { transform: translateY(-72px); }
-            80%, 96% { transform: translateY(-96px); }
-            100% { transform: translateY(0); }
-        }
+        :root{--bg:#0a0a0f;--card:#12121a;--border:#1f1f2e;--accent:#3b82f6}
+        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif;padding-top:20px}
+        .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
+        .btn{padding:10px 20px;border-radius:8px;font-weight:500;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border:none}
+        .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
+        .btn-secondary{background:#1f1f2e;color:#e0e0e0;border:1px solid #2a2a3a}.btn-secondary:hover{background:#2a2a3a}
+        .code-box{background:#0d0d12;border:1px solid var(--border);border-radius:8px;padding:14px 18px;font-family:ui-monospace,monospace}
+        .glow{box-shadow:0 0 40px rgba(59,130,246,0.15)}
+        .endpoint-container{height:24px;overflow:hidden;display:inline-block}
+        .endpoint-slider{animation:slideEndpoints 12s infinite}
+        .endpoint-item{height:24px;line-height:24px}
+        @keyframes slideEndpoints{0%,16%{transform:translateY(0)}20%,36%{transform:translateY(-24px)}40%,56%{transform:translateY(-48px)}60%,76%{transform:translateY(-72px)}80%,96%{transform:translateY(-96px)}100%{transform:translateY(0)}}
     </style>
 </head>
 <body class="min-h-screen">
-    <!-- 导航栏 -->
-    <nav class="border-b border-gray-800 py-4 px-6">
-        <div class="max-w-5xl mx-auto flex justify-between items-center">
-            <div class="flex items-center gap-2">
-                <span class="text-2xl">⚡</span>
-                <span class="font-bold text-xl">{{SITE_NAME}}</span>
-            </div>
-            <div class="flex items-center gap-6">
-                <a href="#api" class="text-gray-400 hover:text-white text-sm transition">API接入</a>
-                <a href="{{NEW_API_URL}}/pricing" target="_blank" class="text-gray-400 hover:text-white text-sm transition">模型广场</a>
-                <a href="{{NEW_API_URL}}/console" target="_blank" class="btn btn-primary text-sm">控制台 →</a>
-            </div>
-        </div>
-    </nav>
-
     <!-- Hero 区域 -->
-    <section class="py-20 px-6">
+    <section class="py-16 px-6">
         <div class="max-w-3xl mx-auto text-center">
-            <h1 class="text-4xl md:text-5xl font-bold mb-4 bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">
-                统一的大模型API网关
-            </h1>
+            <h1 class="text-4xl md:text-5xl font-bold mb-4 bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">统一的大模型API网关</h1>
             <p class="text-lg text-gray-400 mb-10">更低的价格，更稳定的服务，只需替换API地址即可使用</p>
             
-            <!-- API地址展示 -->
             <div class="code-box max-w-2xl mx-auto mb-8">
                 <div class="flex items-center justify-between flex-wrap gap-4">
                     <div class="flex items-center gap-2 text-sm">
                         <span class="text-gray-500">API地址:</span>
-                        <span class="text-blue-400" id="api-base">{{NEW_API_URL}}</span>
+                        <span class="text-blue-400">{{NEW_API_URL}}</span>
                         <div class="endpoint-container">
                             <div class="endpoint-slider">
                                 <div class="endpoint-item text-cyan-400">/v1/chat/completions</div>
@@ -469,20 +387,13 @@ HOME_PAGE = '''<!DOCTYPE html>
                             </div>
                         </div>
                     </div>
-                    <button onclick="copyAPI()" id="copy-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded transition">
-                        复制
-                    </button>
+                    <button onclick="copyAPI()" id="copy-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded transition">复制</button>
                 </div>
             </div>
             
-            <!-- 主要按钮 -->
             <div class="flex justify-center gap-4 flex-wrap">
-                <a href="{{NEW_API_URL}}/console/token" target="_blank" class="btn btn-primary text-base">
-                    🔑 获取API Key
-                </a>
-                <a href="/claim" class="btn btn-secondary text-base">
-                    🎫 领取兑换券
-                </a>
+                <a href="{{NEW_API_URL}}/console/token" target="_blank" class="btn btn-primary text-base">🔑 获取API Key</a>
+                <a href="/claim" class="btn btn-secondary text-base">🎫 领取兑换券</a>
             </div>
         </div>
     </section>
@@ -490,12 +401,8 @@ HOME_PAGE = '''<!DOCTYPE html>
     <!-- API接入教程 -->
     <section id="api" class="py-16 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2">
-                <span>📖</span> API接入教程
-            </h2>
-            
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>📖</span> API接入教程</h2>
             <div class="grid md:grid-cols-2 gap-6">
-                <!-- 获取API Key -->
                 <div class="card p-6">
                     <h3 class="font-semibold text-lg mb-4 text-blue-400">1️⃣ 获取API Key</h3>
                     <ol class="space-y-2 text-gray-400 text-sm">
@@ -505,8 +412,6 @@ HOME_PAGE = '''<!DOCTYPE html>
                         <li>4. 复制生成的 sk-xxx 密钥</li>
                     </ol>
                 </div>
-                
-                <!-- 配置API地址 -->
                 <div class="card p-6">
                     <h3 class="font-semibold text-lg mb-4 text-green-400">2️⃣ 配置API地址</h3>
                     <div class="code-box text-sm mb-3">
@@ -515,8 +420,6 @@ HOME_PAGE = '''<!DOCTYPE html>
                     </div>
                     <p class="text-gray-400 text-sm">将此地址替换到你的应用中即可</p>
                 </div>
-                
-                <!-- ChatGPT-Next-Web -->
                 <div class="card p-6">
                     <h3 class="font-semibold text-lg mb-4 text-purple-400">3️⃣ ChatGPT-Next-Web</h3>
                     <ol class="space-y-2 text-gray-400 text-sm">
@@ -526,8 +429,6 @@ HOME_PAGE = '''<!DOCTYPE html>
                         <li>4. 保存即可使用</li>
                     </ol>
                 </div>
-                
-                <!-- Python示例 -->
                 <div class="card p-6">
                     <h3 class="font-semibold text-lg mb-4 text-orange-400">4️⃣ Python调用示例</h3>
                     <div class="code-box text-xs overflow-x-auto">
@@ -551,22 +452,15 @@ resp = client.chat.completions.create(
     <!-- 兑换券入口 -->
     <section id="coupon" class="py-16 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2">
-                <span>🎫</span> 兑换券领取
-            </h2>
-            
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>🎫</span> 兑换券领取</h2>
             <div class="card p-8 glow">
                 <div class="flex flex-col md:flex-row items-center justify-between gap-6">
                     <div>
                         <h3 class="text-xl font-bold mb-2">免费领取API额度</h3>
                         <p class="text-gray-400 mb-3">每 {{COOLDOWN}} 小时可领取一次，随机获得对应额度的兑换码</p>
-                        <span class="inline-block bg-green-900/40 text-green-400 px-4 py-1.5 rounded-full border border-green-800 text-sm">
-                            📦 当前可领: <b>{{AVAILABLE}}</b> 个
-                        </span>
+                        <span class="inline-block bg-green-900/40 text-green-400 px-4 py-1.5 rounded-full border border-green-800 text-sm">📦 当前可领: <b>{{AVAILABLE}}</b> 个</span>
                     </div>
-                    <a href="/claim" class="btn btn-primary text-lg px-8 py-3">
-                        🎁 立即领取 →
-                    </a>
+                    <a href="/claim" class="btn btn-primary text-lg px-8 py-3">🎁 立即领取 →</a>
                 </div>
             </div>
         </div>
@@ -575,34 +469,19 @@ resp = client.chat.completions.create(
     <!-- 使用须知 -->
     <section class="py-16 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2">
-                <span>📋</span> 使用须知
-            </h2>
-            
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>📋</span> 使用须知</h2>
             <div class="grid md:grid-cols-3 gap-6">
                 <div class="card p-6">
                     <h3 class="font-semibold mb-3 text-blue-400">✅ 允许使用</h3>
-                    <ul class="text-gray-400 text-sm space-y-1">
-                        <li>• 个人学习研究</li>
-                        <li>• 小型项目开发</li>
-                        <li>• 合理频率调用</li>
-                    </ul>
+                    <ul class="text-gray-400 text-sm space-y-1"><li>• 个人学习研究</li><li>• 小型项目开发</li><li>• 合理频率调用</li></ul>
                 </div>
                 <div class="card p-6">
                     <h3 class="font-semibold mb-3 text-red-400">❌ 禁止行为</h3>
-                    <ul class="text-gray-400 text-sm space-y-1">
-                        <li>• 商业盈利用途</li>
-                        <li>• 高频滥用接口</li>
-                        <li>• 违法违规内容</li>
-                    </ul>
+                    <ul class="text-gray-400 text-sm space-y-1"><li>• 商业盈利用途</li><li>• 高频滥用接口</li><li>• 违法违规内容</li></ul>
                 </div>
                 <div class="card p-6">
                     <h3 class="font-semibold mb-3 text-yellow-400">⚠️ 注意事项</h3>
-                    <ul class="text-gray-400 text-sm space-y-1">
-                        <li>• 请勿分享API Key</li>
-                        <li>• 违规将被封禁</li>
-                        <li>• 额度用完需充值</li>
-                    </ul>
+                    <ul class="text-gray-400 text-sm space-y-1"><li>• 请勿分享API Key</li><li>• 违规将被封禁</li><li>• 额度用完需充值</li></ul>
                 </div>
             </div>
         </div>
@@ -610,34 +489,21 @@ resp = client.chat.completions.create(
 
     <!-- 页脚 -->
     <footer class="border-t border-gray-800 py-8 px-6 text-center text-gray-500 text-sm">
-        <p>
-            {{SITE_NAME}} © 2025 | 
-            <a href="{{NEW_API_URL}}/console" class="text-blue-400 hover:underline">控制台</a> | 
-            <a href="{{NEW_API_URL}}/pricing" class="text-blue-400 hover:underline">模型广场</a> | 
-            <a href="/claim" class="text-blue-400 hover:underline">领券中心</a>
-        </p>
+        <p>{{SITE_NAME}} © 2025 | <a href="{{NEW_API_URL}}/console" class="text-blue-400 hover:underline">控制台</a> | <a href="{{NEW_API_URL}}/pricing" class="text-blue-400 hover:underline">模型广场</a> | <a href="/claim" class="text-blue-400 hover:underline">领券中心</a></p>
     </footer>
 
     <script>
-        function copyAPI() {
-            var url = '{{NEW_API_URL}}';
-            navigator.clipboard.writeText(url).then(function() {
-                var btn = document.getElementById('copy-btn');
-                btn.textContent = '已复制';
-                btn.classList.remove('bg-blue-600');
-                btn.classList.add('bg-green-600');
-                setTimeout(function() {
-                    btn.textContent = '复制';
-                    btn.classList.remove('bg-green-600');
-                    btn.classList.add('bg-blue-600');
-                }, 1500);
-            });
+        function copyAPI(){
+            navigator.clipboard.writeText('{{NEW_API_URL}}');
+            var btn=document.getElementById('copy-btn');
+            btn.textContent='已复制';btn.classList.remove('bg-blue-600');btn.classList.add('bg-green-600');
+            setTimeout(function(){btn.textContent='复制';btn.classList.remove('bg-green-600');btn.classList.add('bg-blue-600');},1500);
         }
     </script>
 </body>
 </html>'''
 
-# ============ 兑换券领取页 HTML ============
+
 CLAIM_PAGE = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -646,430 +512,416 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     <title>兑换券领取 - {{SITE_NAME}}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        :root {
-            --bg: #0a0a0f;
-            --card: #12121a;
-            --border: #1f1f2e;
-            --accent: #3b82f6;
-        }
-        body {
-            background: var(--bg);
-            color: #e0e0e0;
-            font-family: system-ui, -apple-system, sans-serif;
-        }
-        .card {
-            background: var(--card);
-            border: 1px solid var(--border);
-            border-radius: 16px;
-        }
-        .input-field {
-            background: #0d0d12;
-            border: 1px solid var(--border);
-            color: #e0e0e0;
-            border-radius: 8px;
-            padding: 12px 16px;
-            width: 100%;
-            font-size: 14px;
-        }
-        .input-field:focus {
-            border-color: var(--accent);
-            outline: none;
-            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
-        }
-        .btn-primary {
-            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
-            color: #fff;
-            padding: 14px;
-            border-radius: 8px;
-            font-weight: 600;
-            border: none;
-            cursor: pointer;
-            width: 100%;
-            font-size: 15px;
-        }
-        .btn-primary:hover {
-            opacity: 0.9;
-        }
-        .btn-primary:disabled {
-            background: #374151;
-            cursor: not-allowed;
-        }
-        .btn-claim {
-            background: linear-gradient(135deg, #10b981, #059669);
-            color: #fff;
-            padding: 16px 40px;
-            border-radius: 12px;
-            font-weight: 700;
-            font-size: 18px;
-            border: none;
-            cursor: pointer;
-            transition: transform 0.2s;
-        }
-        .btn-claim:hover {
-            transform: scale(1.02);
-        }
-        .btn-claim:disabled {
-            background: #374151;
-            cursor: not-allowed;
-            transform: none;
-        }
-        .loading-spinner {
-            display: inline-block;
-            width: 18px;
-            height: 18px;
-            border: 2px solid rgba(255, 255, 255, 0.3);
-            border-radius: 50%;
-            border-top-color: #fff;
-            animation: spin 1s linear infinite;
-        }
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        .toast {
-            position: fixed;
-            top: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            padding: 12px 24px;
-            border-radius: 8px;
-            color: #fff;
-            font-weight: 500;
-            z-index: 1000;
-            animation: fadeIn 0.3s ease;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateX(-50%) translateY(-10px); }
-            to { opacity: 1; transform: translateX(-50%) translateY(0); }
-        }
-        .prize-animation {
-            animation: prizePopup 0.4s ease-out;
-        }
-        @keyframes prizePopup {
-            0% { transform: scale(0.8); opacity: 0; }
-            100% { transform: scale(1); opacity: 1; }
-        }
-        .coupon-item {
-            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 8px;
-        }
+        :root{--bg:#0a0a0f;--card:#12121a;--border:#1f1f2e;--accent:#3b82f6}
+        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif;padding-top:20px}
+        .card{background:var(--card);border:1px solid var(--border);border-radius:16px}
+        .ipt{background:#0d0d12;border:1px solid var(--border);color:#e0e0e0;border-radius:8px;padding:12px 16px;width:100%;font-size:14px}
+        .ipt:focus{border-color:var(--accent);outline:none;box-shadow:0 0 0 2px rgba(59,130,246,0.2)}
+        .btn-p{background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;padding:14px;border-radius:8px;font-weight:600;border:none;cursor:pointer;width:100%;font-size:15px}
+        .btn-p:hover{opacity:0.9}.btn-p:disabled{background:#374151;cursor:not-allowed}
+        .btn-c{background:linear-gradient(135deg,#10b981,#059669);color:#fff;padding:16px 40px;border-radius:12px;font-weight:700;font-size:18px;border:none;cursor:pointer}
+        .btn-c:hover{transform:scale(1.02)}.btn-c:disabled{background:#374151;cursor:not-allowed;transform:none}
+        .ld{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.3);border-radius:50%;border-top-color:#fff;animation:spin 1s linear infinite}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        /* toast位置调整到中间偏下，避免被顶部导航遮挡 */
+        .toast{position:fixed;top:80px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;font-weight:500;z-index:9999;animation:fadeIn .3s}
+        @keyframes fadeIn{from{opacity:0;transform:translateX(-50%) translateY(-10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+        .prize{animation:pop .4s ease-out}
+        @keyframes pop{0%{transform:scale(0.8);opacity:0}100%{transform:scale(1);opacity:1}}
+        .cpn{background:linear-gradient(135deg,#3b82f6,#1d4ed8);border-radius:8px;padding:12px;margin-bottom:8px}
     </style>
 </head>
 <body class="min-h-screen">
-    <!-- 导航 -->
-    <nav class="bg-gradient-to-r from-blue-600 to-blue-800 py-4 px-6">
-        <div class="max-w-4xl mx-auto flex justify-between items-center">
-            <a href="/" class="flex items-center gap-2 text-white">
-                <span class="text-xl">🎫</span>
-                <span class="font-bold">{{SITE_NAME}} 兑换中心</span>
-            </a>
-            <div class="flex items-center gap-4">
-                <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-200 hover:text-white text-sm">钱包充值</a>
-                <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-200 hover:text-white text-sm">控制台 →</a>
-            </div>
-        </div>
-    </nav>
-
     <main class="max-w-md mx-auto px-4 py-8">
         <!-- 登录区域 -->
-        <div id="section-login" class="card p-8">
+        <div id="sec-login" class="card p-8">
             <div class="text-center mb-6">
                 <div class="text-5xl mb-4">🎁</div>
                 <h1 class="text-2xl font-bold">兑换券领取中心</h1>
                 <p class="text-gray-400 mt-2">验证身份后领取免费额度</p>
-                <div class="mt-4 inline-flex items-center bg-blue-900/30 text-blue-300 px-4 py-2 rounded-full border border-blue-800">
-                    📦 当前可领: <span id="available-count" class="font-bold ml-1">{{AVAILABLE}}</span> 个
-                </div>
+                <div class="mt-4 inline-flex items-center bg-blue-900/30 text-blue-300 px-4 py-2 rounded-full border border-blue-800">📦 当前可领: <span id="cnt" class="font-bold ml-1">{{AVAILABLE}}</span> 个</div>
             </div>
-            
             <div class="space-y-4">
-                <div>
-                    <label class="block text-sm text-gray-400 mb-1">用户ID</label>
-                    <input type="number" id="input-userid" class="input-field" placeholder="在个人设置页面查看">
-                </div>
-                <div>
-                    <label class="block text-sm text-gray-400 mb-1">用户名</label>
-                    <input type="text" id="input-username" class="input-field" placeholder="登录用户名">
-                </div>
-                <div>
-                    <label class="block text-sm text-gray-400 mb-1">API Key</label>
-                    <input type="password" id="input-apikey" class="input-field" placeholder="sk-xxx">
-                    <p class="text-xs text-gray-500 mt-1">
-                        在 <a href="{{NEW_API_URL}}/console/token" target="_blank" class="text-blue-400 hover:underline">令牌管理</a> 创建
-                    </p>
-                </div>
-                <button id="btn-verify" class="btn-primary">验证身份</button>
+                <div><label class="block text-sm text-gray-400 mb-1">用户ID</label><input type="number" id="uid" class="ipt" placeholder="在个人设置页面查看"></div>
+                <div><label class="block text-sm text-gray-400 mb-1">用户名</label><input type="text" id="uname" class="ipt" placeholder="登录用户名"></div>
+                <div><label class="block text-sm text-gray-400 mb-1">API Key</label><input type="password" id="ukey" class="ipt" placeholder="sk-xxx"><p class="text-xs text-gray-500 mt-1">在 <a href="{{NEW_API_URL}}/console/token" target="_blank" class="text-blue-400">令牌管理</a> 创建</p></div>
+                <button type="button" class="btn-p" onclick="doVerify()">验证身份</button>
             </div>
         </div>
 
         <!-- 领取区域 -->
-        <div id="section-claim" class="hidden">
-            <!-- 用户信息 -->
+        <div id="sec-claim" style="display:none">
             <div class="card p-4 mb-4">
                 <div class="flex justify-between items-center">
-                    <div>
-                        <p class="text-gray-500 text-sm">当前用户</p>
-                        <p id="display-userinfo" class="font-semibold"></p>
-                    </div>
-                    <button id="btn-logout" class="text-blue-400 text-sm hover:underline">切换账号</button>
+                    <div><p class="text-gray-500 text-sm">当前用户</p><p id="uinfo" class="font-semibold"></p></div>
+                    <button type="button" class="text-blue-400 text-sm hover:underline" onclick="doLogout()">切换账号</button>
                 </div>
             </div>
-
-            <!-- 领取状态 -->
             <div class="card p-6 mb-4">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="font-semibold">领取状态</h2>
-                    <span id="status-badge" class="px-3 py-1 rounded-full text-sm"></span>
+                    <span id="badge" class="px-3 py-1 rounded-full text-sm"></span>
                 </div>
-                
                 <div class="text-center py-4">
-                    <button id="btn-claim" class="btn-claim">🎰 抽取兑换券</button>
-                    <p id="cooldown-message" class="text-gray-500 mt-3 text-sm"></p>
+                    <button type="button" id="claimBtn" class="btn-c" onclick="doClaim()">🎰 抽取兑换券</button>
+                    <p id="cdMsg" class="text-gray-500 mt-3 text-sm"></p>
                 </div>
-                
-                <!-- 中奖展示 -->
-                <div id="prize-display" class="hidden text-center py-4">
-                    <div class="prize-animation">
-                        <div id="prize-title" class="text-3xl font-bold text-green-400 mb-2"></div>
-                        <div id="prize-code" class="font-mono text-lg bg-gray-800 p-3 rounded-lg border border-gray-700"></div>
-                        <button id="btn-copy-prize" class="mt-3 text-blue-400 text-sm hover:underline">📋 复制兑换码</button>
+                <div id="prizeBox" style="display:none" class="text-center py-4">
+                    <div class="prize">
+                        <div id="prizeTitle" class="text-3xl font-bold text-green-400 mb-2"></div>
+                        <div id="prizeCode" class="font-mono text-lg bg-gray-800 p-3 rounded-lg border border-gray-700"></div>
+                        <button type="button" class="mt-3 text-blue-400 text-sm hover:underline" onclick="copyPrize()">📋 复制兑换码</button>
                     </div>
                 </div>
             </div>
-
-            <!-- 领取记录 -->
             <div class="card p-6">
                 <h2 class="font-semibold mb-3">📋 领取记录</h2>
-                <div id="history-list"></div>
+                <div id="hist"></div>
             </div>
         </div>
     </main>
 
     <footer class="text-center py-6 text-gray-600 text-sm">
-        每 {{COOLDOWN}} 小时可领取一次 | 
-        <a href="/" class="text-blue-400 hover:underline">返回首页</a> | 
-        <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400 hover:underline">钱包充值</a>
+        每 {{COOLDOWN}} 小时可领取一次 | <a href="/" class="text-blue-400 hover:underline">返回首页</a> | <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400 hover:underline">钱包充值</a>
     </footer>
 
     <script>
-        var userData = null;
+    var ud = null;
 
-        // 页面加载
-        window.onload = function() {
-            // 尝试恢复用户数据
-            var saved = localStorage.getItem('coupon_user');
-            if (saved) {
-                try {
-                    userData = JSON.parse(saved);
-                    document.getElementById('input-userid').value = userData.user_id || '';
-                    document.getElementById('input-username').value = userData.username || '';
-                    document.getElementById('input-apikey').value = userData.api_key || '';
-                } catch (e) {
-                    console.error('解析用户数据失败', e);
+    (function(){
+        var s = localStorage.getItem('coupon_user');
+        if(s){
+            try{ ud = JSON.parse(s); document.getElementById('uid').value = ud.user_id||''; document.getElementById('uname').value = ud.username||''; document.getElementById('ukey').value = ud.api_key||''; }catch(e){}
+        }
+    })();
+
+    function toast(msg, ok){
+        var t = document.createElement('div');
+        t.className = 'toast ' + (ok ? 'bg-green-600' : 'bg-red-600');
+        t.textContent = msg;
+        document.body.appendChild(t);
+        setTimeout(function(){ t.remove(); }, 3000);
+    }
+
+    function doVerify(){
+        var uid = document.getElementById('uid').value.trim();
+        var uname = document.getElementById('uname').value.trim();
+        var ukey = document.getElementById('ukey').value.trim();
+        if(!uid || !uname || !ukey){ toast('请填写完整信息', false); return; }
+
+        var btn = event.target;
+        btn.disabled = true; btn.innerHTML = '<span class="ld"></span> 验证中...';
+
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/verify', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                btn.disabled = false; btn.textContent = '验证身份';
+                if(xhr.status === 200){
+                    try{
+                        var res = JSON.parse(xhr.responseText);
+                        if(res.success){
+                            ud = {user_id: parseInt(uid), username: uname, api_key: ukey};
+                            localStorage.setItem('coupon_user', JSON.stringify(ud));
+                            showLogged(); loadStatus(); toast('验证成功', true);
+                        }
+                    }catch(e){ toast('解析错误', false); }
+                } else {
+                    try{ var res = JSON.parse(xhr.responseText); toast(res.detail || '验证失败', false); }catch(e){ toast('验证失败', false); }
                 }
             }
-
-            // 绑定事件
-            document.getElementById('btn-verify').addEventListener('click', handleVerify);
-            document.getElementById('btn-logout').addEventListener('click', handleLogout);
-            document.getElementById('btn-claim').addEventListener('click', handleClaim);
-            document.getElementById('btn-copy-prize').addEventListener('click', handleCopyPrize);
         };
+        xhr.onerror = function(){ btn.disabled = false; btn.textContent = '验证身份'; toast('网络错误', false); };
+        xhr.send(JSON.stringify({user_id: parseInt(uid), username: uname, api_key: ukey}));
+    }
 
-        // 显示提示
-        function showToast(message, isSuccess) {
-            var toast = document.createElement('div');
-            toast.className = 'toast ' + (isSuccess ? 'bg-green-600' : 'bg-red-600');
-            toast.textContent = message;
-            document.body.appendChild(toast);
-            setTimeout(function() {
-                toast.remove();
-            }, 3000);
-        }
+    function showLogged(){
+        document.getElementById('sec-login').style.display = 'none';
+        document.getElementById('sec-claim').style.display = 'block';
+        document.getElementById('uinfo').textContent = ud.username + ' (ID:' + ud.user_id + ')';
+    }
 
-        // 验证身份
-        function handleVerify() {
-            var userId = document.getElementById('input-userid').value.trim();
-            var username = document.getElementById('input-username').value.trim();
-            var apiKey = document.getElementById('input-apikey').value.trim();
+    function doLogout(){
+        localStorage.removeItem('coupon_user'); ud = null;
+        document.getElementById('sec-login').style.display = 'block';
+        document.getElementById('sec-claim').style.display = 'none';
+    }
 
-            if (!userId || !username || !apiKey) {
-                showToast('请填写完整信息', false);
-                return;
+    function loadStatus(){
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/claim/status', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4 && xhr.status === 200){
+                try{ var res = JSON.parse(xhr.responseText); if(res.success) updateUI(res.data); }catch(e){}
             }
+        };
+        xhr.send(JSON.stringify(ud));
+    }
 
-            var btn = document.getElementById('btn-verify');
+    function updateUI(d){
+        document.getElementById('cnt').textContent = d.available_count;
+        var btn = document.getElementById('claimBtn');
+        var badge = document.getElementById('badge');
+        var msg = document.getElementById('cdMsg');
+        if(d.can_claim){
+            btn.disabled = false;
+            badge.textContent = '✅ 可领取'; badge.className = 'px-3 py-1 rounded-full text-sm bg-green-900/50 text-green-400 border border-green-700';
+            msg.textContent = '';
+        } else {
             btn.disabled = true;
-            btn.innerHTML = '<span class="loading-spinner"></span> 验证中...';
-
-            fetch('/api/verify', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    user_id: parseInt(userId),
-                    username: username,
-                    api_key: apiKey
-                })
-            })
-            .then(function(response) {
-                return response.json().then(function(data) {
-                    return { ok: response.ok, data: data };
-                });
-            })
-            .then(function(result) {
-                if (result.ok && result.data.success) {
-                    userData = {
-                        user_id: parseInt(userId),
-                        username: username,
-                        api_key: apiKey
-                    };
-                    localStorage.setItem('coupon_user', JSON.stringify(userData));
-                    showLoggedInUI();
-                    loadClaimStatus();
-                    showToast('验证成功', true);
-                } else {
-                    showToast(result.data.detail || '验证失败', false);
-                }
-            })
-            .catch(function(error) {
-                console.error('验证请求失败', error);
-                showToast('网络错误，请重试', false);
-            })
-            .finally(function() {
-                btn.disabled = false;
-                btn.textContent = '验证身份';
-            });
+            badge.textContent = '⏳ 冷却中'; badge.className = 'px-3 py-1 rounded-full text-sm bg-yellow-900/50 text-yellow-400 border border-yellow-700';
+            msg.textContent = d.cooldown_text || '';
         }
-
-        // 显示已登录界面
-        function showLoggedInUI() {
-            document.getElementById('section-login').classList.add('hidden');
-            document.getElementById('section-claim').classList.remove('hidden');
-            document.getElementById('display-userinfo').textContent = userData.username + ' (ID:' + userData.user_id + ')';
-        }
-
-        // 退出登录
-        function handleLogout() {
-            localStorage.removeItem('coupon_user');
-            userData = null;
-            document.getElementById('section-login').classList.remove('hidden');
-            document.getElementById('section-claim').classList.add('hidden');
-        }
-
-        // 加载领取状态
-        function loadClaimStatus() {
-            fetch('/api/claim/status', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(userData)
-            })
-            .then(function(response) {
-                return response.json();
-            })
-            .then(function(data) {
-                if (data.success) {
-                    updateClaimUI(data.data);
-                }
-            })
-            .catch(function(error) {
-                console.error('加载状态失败', error);
-            });
-        }
-
-        // 更新领取界面
-        function updateClaimUI(data) {
-            document.getElementById('available-count').textContent = data.available_count;
-
-            var btn = document.getElementById('btn-claim');
-            var badge = document.getElementById('status-badge');
-            var msg = document.getElementById('cooldown-message');
-
-            if (data.can_claim) {
-                btn.disabled = false;
-                badge.textContent = '✅ 可领取';
-                badge.className = 'px-3 py-1 rounded-full text-sm bg-green-900/50 text-green-400 border border-green-700';
-                msg.textContent = '';
-            } else {
-                btn.disabled = true;
-                badge.textContent = '⏳ 冷却中';
-                badge.className = 'px-3 py-1 rounded-full text-sm bg-yellow-900/50 text-yellow-400 border border-yellow-700';
-                msg.textContent = data.cooldown_text || '';
+        var h = document.getElementById('hist');
+        if(!d.history || d.history.length === 0){ h.innerHTML = '<p class="text-gray-500 text-center text-sm">暂无记录</p>'; }
+        else {
+            var html = '';
+            for(var i=0; i<d.history.length; i++){
+                var r = d.history[i];
+                html += '<div class="cpn text-white"><div class="flex justify-between"><span class="font-mono text-sm">'+r.coupon_code+'</span></div><div class="text-xs text-blue-200 mt-1">'+new Date(r.claim_time).toLocaleString('zh-CN')+'</div></div>';
             }
-
-            // 渲染历史记录
-            var historyList = document.getElementById('history-list');
-            if (!data.history || data.history.length === 0) {
-                historyList.innerHTML = '<p class="text-gray-500 text-center text-sm">暂无领取记录</p>';
-            } else {
-                var html = '';
-                for (var i = 0; i < data.history.length; i++) {
-                    var record = data.history[i];
-                    var date = new Date(record.claim_time).toLocaleString('zh-CN');
-                    html += '<div class="coupon-item text-white">';
-                    html += '<div class="flex justify-between items-center">';
-                    html += '<span class="font-mono text-sm">' + record.coupon_code + '</span>';
-                    html += '</div>';
-                    html += '<div class="text-xs text-blue-200 mt-1">' + date + '</div>';
-                    html += '</div>';
-                }
-                historyList.innerHTML = html;
-            }
+            h.innerHTML = html;
         }
+    }
 
-        // 领取兑换券
-        function handleClaim() {
-            var btn = document.getElementById('btn-claim');
-            btn.disabled = true;
-            btn.innerHTML = '<span class="loading-spinner"></span> 抽取中...';
-            document.getElementById('prize-display').classList.add('hidden');
+    function doClaim(){
+        var btn = document.getElementById('claimBtn');
+        btn.disabled = true; btn.innerHTML = '<span class="ld"></span> 抽取中...';
+        document.getElementById('prizeBox').style.display = 'none';
 
-            fetch('/api/claim', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(userData)
-            })
-            .then(function(response) {
-                return response.json().then(function(data) {
-                    return { ok: response.ok, data: data };
-                });
-            })
-            .then(function(result) {
-                if (result.ok && result.data.success) {
-                    var couponData = result.data.data;
-                    document.getElementById('prize-title').textContent = '🎉 恭喜获得额度!';
-                    document.getElementById('prize-code').textContent = couponData.coupon_code;
-                    document.getElementById('prize-display').classList.remove('hidden');
-
-                    // 自动复制
-                    navigator.clipboard.writeText(couponData.coupon_code).then(function() {
-                        showToast('兑换码已复制到剪贴板', true);
-                    }).catch(function() {
-                        showToast('领取成功！请手动复制兑换码', true);
-                    });
-                } else {
-                    showToast(result.data.detail || '领取失败', false);
-                }
-            })
-            .catch(function(error) {
-                console.error('领取请求失败', error);
-                showToast('网络错误，请重试', false);
-            })
-            .finally(function() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/claim', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
                 btn.innerHTML = '🎰 抽取兑换券';
-                loadClaimStatus();
-            });
-        }
+                if(xhr.status === 200){
+                    try{
+                        var res = JSON.parse(xhr.responseText);
+                        if(res.success){
+                            document.getElementById('prizeTitle').textContent = '🎉 恭喜获得额度!';
+                            document.getElementById('prizeCode').textContent = res.data.coupon_code;
+                            document.getElementById('prizeBox').style.display = 'block';
+                            try{ navigator.clipboard.writeText(res.data.coupon_code); toast('兑换码已复制', true); }catch(e){ toast('领取成功', true); }
+                        }
+                    }catch(e){ toast('解析错误', false); }
+                } else {
+                    try{ var res = JSON.parse(xhr.responseText); toast(res.detail || '领取失败', false); }catch(e){ toast('领取失败', false); }
+                }
+                loadStatus();
+            }
+        };
+        xhr.onerror = function(){ btn.innerHTML = '🎰 抽取兑换券'; toast('网络错误', false); loadStatus(); };
+        xhr.send(JSON.stringify(ud));
+    }
 
-        // 复制兑换码
-        function handleCopyPrize() {
-            var code = document.getElementById('prize-code').textContent;
-            navigator.clipboard.writeText(code).then(function() {
-                showToast('已复制到剪贴板', true);
-            }).catch(function() {
-                showToast('复制失败，请手动复制', false);
-            });
-        }
+    function copyPrize(){
+        var code = document.getElementById('prizeCode').textContent;
+        try{ navigator.clipboard.writeText(code); toast('已复制', true); }catch(e){ toast('复制失败', false); }
+    }
+    </script>
+</body>
+</html>'''
+
+
+ADMIN_PAGE = '''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>管理后台 - {{SITE_NAME}}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui,sans-serif}
+        .card{background:#12121a;border:1px solid #1f1f2e;border-radius:12px}
+        .ipt{background:#0d0d12;border:1px solid #1f1f2e;color:#e0e0e0;border-radius:8px;padding:12px 16px;width:100%}
+        .ipt:focus{border-color:#3b82f6;outline:none}
+        .btn{padding:12px 24px;border-radius:8px;font-weight:600;border:none;cursor:pointer;width:100%}
+        .btn-blue{background:#3b82f6;color:#fff}
+        .btn-blue:hover{background:#2563eb}
+        .btn-green{background:#10b981;color:#fff}
+        .btn-green:hover{background:#059669}
+        #overlay{position:fixed;inset:0;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:100}
+        #toast{position:fixed;top:80px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;z-index:200;display:none}
+    </style>
+</head>
+<body class="min-h-screen">
+    <div id="overlay">
+        <div class="card p-8 w-full max-w-sm mx-4">
+            <div class="text-center mb-6">
+                <div class="text-4xl mb-2">🔐</div>
+                <h1 class="text-xl font-bold">管理后台</h1>
+                <p class="text-gray-500 text-sm">请输入管理员密码</p>
+            </div>
+            <input type="password" id="loginPwd" class="ipt mb-4" placeholder="管理员密码">
+            <button type="button" class="btn btn-blue" onclick="doLogin()">登录</button>
+            <a href="/" class="block text-center text-gray-500 text-sm mt-4 hover:text-blue-400">← 返回首页</a>
+            <p id="loginErr" class="text-red-500 text-center text-sm mt-2" style="display:none"></p>
+        </div>
+    </div>
+
+    <div id="adminMain" style="display:none">
+        <div class="border-b border-gray-800 py-4 px-6">
+            <div class="max-w-6xl mx-auto flex justify-between items-center">
+                <h1 class="font-bold text-xl">🔧 管理后台</h1>
+                <div class="flex items-center gap-4">
+                    <a href="/" class="text-gray-400 hover:text-white text-sm">← 首页</a>
+                    <button type="button" class="text-red-400 text-sm" onclick="doLogout()">退出</button>
+                </div>
+            </div>
+        </div>
+
+        <main class="max-w-6xl mx-auto px-4 py-8">
+            <div class="grid lg:grid-cols-3 gap-6">
+                <div class="lg:col-span-2 space-y-6">
+                    <div class="card p-6">
+                        <h2 class="font-semibold mb-4">📤 添加兑换码</h2>
+                        <div class="grid grid-cols-5 gap-2 mb-4">
+                            <button type="button" onclick="setQ(1)" class="bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold">$1</button>
+                            <button type="button" onclick="setQ(5)" class="bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold">$5</button>
+                            <button type="button" onclick="setQ(10)" class="bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold">$10</button>
+                            <button type="button" onclick="setQ(50)" class="bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold">$50</button>
+                            <button type="button" onclick="setQ(100)" class="bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold">$100</button>
+                        </div>
+                        <div class="flex items-center gap-2 mb-4"><span class="text-gray-400">额度:</span><input type="number" id="quotaVal" value="1" class="w-20 ipt text-center font-bold"><span class="text-gray-400">美元</span></div>
+                        <div class="mb-4"><label class="block text-sm text-gray-400 mb-2">上传TXT文件</label><input type="file" id="txtFile" accept=".txt" class="ipt"></div>
+                        <button type="button" class="btn btn-blue mb-4" onclick="doUpload()">上传文件</button>
+                        <hr class="border-gray-700 my-4">
+                        <div><label class="block text-sm text-gray-400 mb-2">或手动粘贴</label><textarea id="codesText" rows="4" class="ipt font-mono text-sm" placeholder="每行一个"></textarea></div>
+                        <button type="button" class="btn btn-green mt-3" onclick="doAdd()">添加兑换码</button>
+                    </div>
+                    <div class="card p-6">
+                        <h2 class="font-semibold mb-4">🎰 概率说明</h2>
+                        <div class="grid grid-cols-5 gap-2 text-center text-sm">
+                            <div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-green-400 font-bold">$1</div><div class="text-gray-500">50%</div></div>
+                            <div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-blue-400 font-bold">$5</div><div class="text-gray-500">30%</div></div>
+                            <div class="bg-purple-900/30 p-3 rounded border border-purple-800"><div class="text-purple-400 font-bold">$10</div><div class="text-gray-500">15%</div></div>
+                            <div class="bg-orange-900/30 p-3 rounded border border-orange-800"><div class="text-orange-400 font-bold">$50</div><div class="text-gray-500">4%</div></div>
+                            <div class="bg-red-900/30 p-3 rounded border border-red-800"><div class="text-red-400 font-bold">$100</div><div class="text-gray-500">1%</div></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="space-y-6">
+                    <div class="card p-6"><div class="flex justify-between items-center mb-4"><h2 class="font-semibold">📊 统计</h2><button type="button" class="text-blue-400 text-sm" onclick="loadStats()">刷新</button></div><div id="statsBox">加载中...</div></div>
+                    <div class="card p-6"><h2 class="font-semibold mb-4">📋 最近领取</h2><div id="recentBox" class="max-h-80 overflow-y-auto space-y-2 text-sm"></div></div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <div id="toast"></div>
+
+    <script>
+    var pwd = '';
+    (function(){
+        var s = sessionStorage.getItem('admin_pwd');
+        if(s){ pwd = s; verifyPwd(); }
+        document.getElementById('loginPwd').onkeydown = function(e){ if(e.key==='Enter') doLogin(); };
+    })();
+
+    function toast(msg, ok){
+        var t = document.getElementById('toast');
+        t.textContent = msg; t.style.display = 'block'; t.style.background = ok ? '#10b981' : '#ef4444';
+        setTimeout(function(){ t.style.display = 'none'; }, 3000);
+    }
+
+    function doLogin(){
+        var p = document.getElementById('loginPwd').value;
+        var err = document.getElementById('loginErr');
+        if(!p){ err.textContent = '请输入密码'; err.style.display = 'block'; return; }
+        err.style.display = 'none';
+
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/login', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                if(xhr.status === 200){
+                    pwd = p; sessionStorage.setItem('admin_pwd', p);
+                    document.getElementById('overlay').style.display = 'none';
+                    document.getElementById('adminMain').style.display = 'block';
+                    loadStats();
+                } else {
+                    err.textContent = '密码错误'; err.style.display = 'block';
+                }
+            }
+        };
+        xhr.onerror = function(){ err.textContent = '网络错误'; err.style.display = 'block'; };
+        xhr.send(JSON.stringify({password: p}));
+    }
+
+    function verifyPwd(){
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/api/admin/stats?password=' + encodeURIComponent(pwd), true);
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                if(xhr.status === 200){
+                    document.getElementById('overlay').style.display = 'none';
+                    document.getElementById('adminMain').style.display = 'block';
+                    loadStats();
+                } else { sessionStorage.removeItem('admin_pwd'); pwd = ''; }
+            }
+        };
+        xhr.send();
+    }
+
+    function doLogout(){ sessionStorage.removeItem('admin_pwd'); pwd = ''; location.reload(); }
+    function setQ(q){ document.getElementById('quotaVal').value = q; }
+
+    function doUpload(){
+        var q = document.getElementById('quotaVal').value;
+        var f = document.getElementById('txtFile').files[0];
+        if(!f){ toast('请选择文件', false); return; }
+        var fd = new FormData(); fd.append('password', pwd); fd.append('quota', q); fd.append('file', f);
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/upload-txt', true);
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200); if(xhr.status === 200){ loadStats(); document.getElementById('txtFile').value = ''; } }catch(e){ toast('失败', false); }
+            }
+        };
+        xhr.send(fd);
+    }
+
+    function doAdd(){
+        var q = parseFloat(document.getElementById('quotaVal').value);
+        var txt = document.getElementById('codesText').value;
+        var arr = txt.split('\\n').filter(function(s){ return s.trim(); });
+        if(!arr.length){ toast('请输入兑换码', false); return; }
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/add-coupons', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200); if(xhr.status === 200){ loadStats(); document.getElementById('codesText').value = ''; } }catch(e){ toast('失败', false); }
+            }
+        };
+        xhr.send(JSON.stringify({password: pwd, quota: q, coupons: arr}));
+    }
+
+    function loadStats(){
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/api/admin/stats?password=' + encodeURIComponent(pwd), true);
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4 && xhr.status === 200){
+                try{
+                    var res = JSON.parse(xhr.responseText);
+                    if(res.success){
+                        var d = res.data;
+                        var h = '<div class="grid grid-cols-3 gap-2 text-center mb-4"><div class="bg-gray-800 p-3 rounded"><div class="text-xl font-bold">'+d.total+'</div><div class="text-xs text-gray-500">总数</div></div><div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-xl font-bold text-green-400">'+d.available+'</div><div class="text-xs text-gray-500">可用</div></div><div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-xs text-gray-500">已领</div></div></div><div class="space-y-1">';
+                        for(var k in d.quota_stats){ var v = d.quota_stats[k]; h += '<div class="flex justify-between text-sm bg-gray-800/50 p-2 rounded"><span>'+k+'</span><span class="text-green-400">'+v.available+'</span><span class="text-gray-500">'+v.claimed+'</span></div>'; }
+                        h += '</div>';
+                        document.getElementById('statsBox').innerHTML = h;
+                        var rh = '';
+                        for(var i=0; i<d.recent_claims.length; i++){ var c = d.recent_claims[i]; rh += '<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span> <span class="text-gray-600">'+c.time+'</span></div>'; }
+                        document.getElementById('recentBox').innerHTML = rh || '<p class="text-gray-600">暂无</p>';
+                    }
+                }catch(e){}
+            }
+        };
+        xhr.send();
+    }
     </script>
 </body>
 </html>'''
