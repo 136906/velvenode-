@@ -952,6 +952,10 @@ HOME_PAGE = '''<!DOCTYPE html>
         .btn-console{background:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#fff}.btn-console:hover{opacity:0.9}
         .code-box{background:#0d0d12;border:1px solid var(--border);border-radius:8px;padding:14px 18px;font-family:ui-monospace,monospace}
         .glow{box-shadow:0 0 40px rgba(59,130,246,0.15)}
+        .endpoint-container{height:24px;overflow:hidden;display:inline-block}
+        .endpoint-slider{animation:slideEndpoints 12s infinite}
+        .endpoint-item{height:24px;line-height:24px}
+        @keyframes slideEndpoints{0%,16%{transform:translateY(0)}20%,36%{transform:translateY(-24px)}40%,56%{transform:translateY(-48px)}60%,76%{transform:translateY(-72px)}80%,96%{transform:translateY(-96px)}100%{transform:translateY(0)}}
     </style>
 </head>
 <body class="min-h-screen">
@@ -965,6 +969,15 @@ HOME_PAGE = '''<!DOCTYPE html>
                     <div class="flex items-center gap-2 text-sm">
                         <span class="text-gray-500">API地址:</span>
                         <span class="text-blue-400">{{NEW_API_URL}}</span>
+                        <div class="endpoint-container">
+                            <div class="endpoint-slider">
+                                <div class="endpoint-item text-cyan-400">/v1/chat/completions</div>
+                                <div class="endpoint-item text-cyan-400">/v1/models</div>
+                                <div class="endpoint-item text-cyan-400">/v1/embeddings</div>
+                                <div class="endpoint-item text-cyan-400">/v1/images/generations</div>
+                                <div class="endpoint-item text-cyan-400">/v1/audio/transcriptions</div>
+                            </div>
+                        </div>
                     </div>
                     <button onclick="copyAPI()" id="copy-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded transition">复制</button>
                 </div>
@@ -978,6 +991,58 @@ HOME_PAGE = '''<!DOCTYPE html>
         </div>
     </section>
 
+    <!-- API接入教程 -->
+    <section id="api" class="py-16 px-6 border-t border-gray-800">
+        <div class="max-w-4xl mx-auto">
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>📖</span> API接入教程</h2>
+            <div class="grid md:grid-cols-2 gap-6">
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-blue-400">1️⃣ 获取API Key</h3>
+                    <ol class="space-y-2 text-gray-400 text-sm">
+                        <li>1. 访问 <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">{{SITE_NAME}}控制台</a></li>
+                        <li>2. 注册/登录账号</li>
+                        <li>3. 进入「<a href="{{NEW_API_URL}}/console/token" target="_blank" class="text-blue-400 hover:underline">令牌管理</a>」创建API Key</li>
+                        <li>4. 复制生成的 sk-xxx 密钥</li>
+                    </ol>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-green-400">2️⃣ 配置API地址</h3>
+                    <div class="code-box text-sm mb-3">
+                        <div class="text-gray-500"># API Base URL</div>
+                        <div class="text-green-400">{{NEW_API_URL}}</div>
+                    </div>
+                    <p class="text-gray-400 text-sm">将此地址替换到你的应用中即可</p>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-purple-400">3️⃣ ChatGPT-Next-Web</h3>
+                    <ol class="space-y-2 text-gray-400 text-sm">
+                        <li>1. 设置 → 自定义接口</li>
+                        <li>2. 接口地址: <code class="text-purple-400 bg-purple-900/30 px-1 rounded">{{NEW_API_URL}}</code></li>
+                        <li>3. API Key: 填入你的密钥</li>
+                        <li>4. 保存即可使用</li>
+                    </ol>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-orange-400">4️⃣ Python调用示例</h3>
+                    <div class="code-box text-xs overflow-x-auto">
+                        <pre class="text-gray-300">from openai import OpenAI
+
+client = OpenAI(
+    api_key="sk-xxx",
+    base_url="{{NEW_API_URL}}/v1"
+)
+
+resp = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role":"user","content":"Hi"}]
+)</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 兑换券领取 -->
     <section id="coupon" class="py-16 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
             <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>🎫</span> 兑换券领取</h2>
@@ -985,7 +1050,7 @@ HOME_PAGE = '''<!DOCTYPE html>
                 <div class="flex flex-col md:flex-row items-center justify-between gap-6">
                     <div>
                         <h3 class="text-xl font-bold mb-2">免费领取API额度</h3>
-                        <p class="text-gray-400 mb-3">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次</p>
+                        <p class="text-gray-400 mb-3">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次，随机获得对应额度的兑换码</p>
                         <span class="inline-block bg-green-900/40 text-green-400 px-4 py-1.5 rounded-full border border-green-800 text-sm">📦 当前可领: <b id="avail-cnt">{{AVAILABLE}}</b> 个</span>
                         <div id="bigPrizesHome" class="mt-3"></div>
                     </div>
@@ -995,16 +1060,49 @@ HOME_PAGE = '''<!DOCTYPE html>
         </div>
     </section>
 
+    <!-- 使用须知 -->
+    <section class="py-16 px-6 border-t border-gray-800">
+        <div class="max-w-4xl mx-auto">
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>📋</span> 使用须知</h2>
+            <div class="grid md:grid-cols-3 gap-6">
+                <div class="card p-6">
+                    <h3 class="font-semibold mb-3 text-blue-400">✅ 允许使用</h3>
+                    <ul class="text-gray-400 text-sm space-y-1">
+                        <li>• 个人学习研究</li>
+                        <li>• 小型项目开发</li>
+                        <li>• 合理频率调用</li>
+                    </ul>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold mb-3 text-red-400">❌ 禁止行为</h3>
+                    <ul class="text-gray-400 text-sm space-y-1">
+                        <li>• 商业盈利用途</li>
+                        <li>• 高频滥用接口</li>
+                        <li>• 违法违规内容</li>
+                    </ul>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold mb-3 text-yellow-400">⚠️ 注意事项</h3>
+                    <ul class="text-gray-400 text-sm space-y-1">
+                        <li>• 请勿分享API Key</li>
+                        <li>• 违规将被封禁</li>
+                        <li>• 额度用完使用兑换码</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
     <footer class="border-t border-gray-800 py-8 px-6 text-center text-gray-500 text-sm">
-        <p>{{SITE_NAME}} © 2025</p>
+        <p>{{SITE_NAME}} © 2025 | <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">控制台</a> | <a href="{{NEW_API_URL}}/pricing" target="_blank" class="text-blue-400 hover:underline">模型广场</a> | <a href="/claim" target="_top" class="text-blue-400 hover:underline">领券中心</a></p>
     </footer>
 
     <script>
         function copyAPI(){
             navigator.clipboard.writeText('{{NEW_API_URL}}');
             var btn=document.getElementById('copy-btn');
-            btn.textContent='已复制';btn.classList.add('bg-green-600');
-            setTimeout(function(){btn.textContent='复制';btn.classList.remove('bg-green-600');},1500);
+            btn.textContent='已复制';btn.classList.remove('bg-blue-600');btn.classList.add('bg-green-600');
+            setTimeout(function(){btn.textContent='复制';btn.classList.remove('bg-green-600');btn.classList.add('bg-blue-600');},1500);
         }
         fetch('/api/stats/public').then(r=>r.json()).then(d=>{
             document.getElementById('avail-cnt').textContent=d.available;
