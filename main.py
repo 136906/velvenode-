@@ -12,15 +12,20 @@ import json
 # ============ 配置 ============
 NEW_API_URL = os.getenv("NEW_API_URL", "https://velvenode.zeabur.app")
 COUPON_SITE_URL = os.getenv("COUPON_SITE_URL", "https://velvenodehome.zeabur.app")
+
+# 持久化数据目录
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-os.makedirs(DATA_DIR, exist_ok=True)  # 确保目录存在
+os.makedirs(DATA_DIR, exist_ok=True)
+
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR}/coupon.db")
+
 SITE_NAME = os.getenv("SITE_NAME", "velvenode")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
 # 默认配置（会被数据库配置覆盖）
-DEFAULT_COOLDOWN_HOURS = 8
-DEFAULT_QUOTA_WEIGHTS = {1: 50, 5: 30, 10: 15, 50: 4, 100: 1}
+DEFAULT_COOLDOWN_MINUTES = 480  # 8小时 = 480分钟
+DEFAULT_CLAIM_TIMES = 1  # 每个冷却周期可领取次数
+DEFAULT_QUOTA_WEIGHTS = {"1": 50, "5": 30, "10": 15, "50": 4, "100": 1}
 
 # ============ 数据库 ============
 Base = declarative_base()
@@ -65,14 +70,12 @@ def get_db():
 
 # ============ 配置管理函数 ============
 def get_config(db: Session, key: str, default=None):
-    """获取配置值"""
     config = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
     if config:
         return config.config_value
     return default
 
 def set_config(db: Session, key: str, value: str):
-    """设置配置值"""
     config = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
     if config:
         config.config_value = value
@@ -82,18 +85,25 @@ def set_config(db: Session, key: str, value: str):
         db.add(config)
     db.commit()
 
-def get_cooldown_hours(db: Session) -> int:
-    """获取冷却时间（小时）"""
-    val = get_config(db, "cooldown_hours")
+def get_cooldown_minutes(db: Session) -> int:
+    val = get_config(db, "cooldown_minutes")
     if val:
         try:
             return int(val)
         except:
             pass
-    return DEFAULT_COOLDOWN_HOURS
+    return DEFAULT_COOLDOWN_MINUTES
+
+def get_claim_times(db: Session) -> int:
+    val = get_config(db, "claim_times")
+    if val:
+        try:
+            return max(1, int(val))
+        except:
+            pass
+    return DEFAULT_CLAIM_TIMES
 
 def get_quota_weights(db: Session) -> dict:
-    """获取概率权重配置"""
     val = get_config(db, "quota_weights")
     if val:
         try:
@@ -103,9 +113,10 @@ def get_quota_weights(db: Session) -> dict:
     return DEFAULT_QUOTA_WEIGHTS.copy()
 
 def init_default_config(db: Session):
-    """初始化默认配置"""
-    if not get_config(db, "cooldown_hours"):
-        set_config(db, "cooldown_hours", str(DEFAULT_COOLDOWN_HOURS))
+    if not get_config(db, "cooldown_minutes"):
+        set_config(db, "cooldown_minutes", str(DEFAULT_COOLDOWN_MINUTES))
+    if not get_config(db, "claim_times"):
+        set_config(db, "claim_times", str(DEFAULT_CLAIM_TIMES))
     if not get_config(db, "quota_weights"):
         set_config(db, "quota_weights", json.dumps(DEFAULT_QUOTA_WEIGHTS))
 
@@ -121,55 +132,31 @@ def now_utc():
 
 # ============ 用户验证函数 ============
 async def verify_user_identity(user_id: int, username: str, api_key: str) -> bool:
-    """
-    验证用户身份：通过调用主站 API 验证 API Key 是否有效
-    """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # 尝试调用主站的 /v1/models 接口验证 API Key
             response = await client.get(
                 f"{NEW_API_URL}/v1/models",
                 headers={"Authorization": f"Bearer {api_key}"}
             )
-            
             if response.status_code == 200:
                 return True
             
-            # 如果 /v1/models 不行，尝试其他验证方式
-            # 比如调用用户信息接口
             response2 = await client.get(
                 f"{NEW_API_URL}/api/user/self",
                 headers={"Authorization": f"Bearer {api_key}"}
             )
-            
             if response2.status_code == 200:
-                try:
-                    data = response2.json()
-                    # 验证用户ID和用户名是否匹配
-                    if data.get("data", {}).get("id") == user_id or data.get("id") == user_id:
-                        return True
-                    if data.get("data", {}).get("username") == username or data.get("username") == username:
-                        return True
-                except:
-                    pass
                 return True
             
             return False
-    except httpx.TimeoutException:
-        # 超时时，为了用户体验，可以选择放行或拒绝
-        # 这里选择拒绝，更安全
-        return False
-    except Exception as e:
-        print(f"验证用户身份时出错: {e}")
+    except:
         return False
 
 def get_random_coupon(db: Session):
-    """根据概率权重随机选择一个兑换码"""
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).all()
     if not available:
         return None
     
-    # 获取当前概率配置
     quota_weights = get_quota_weights(db)
     
     by_quota = {}
@@ -181,21 +168,17 @@ def get_random_coupon(db: Session):
     
     choices, weights = [], []
     for quota, coupons in by_quota.items():
-        # 查找配置的概率
         quota_str = str(quota)
-        quota_int = int(quota) if quota == int(quota) else quota
+        weight = None
         
-        if quota_str in quota_weights:
-            weight = quota_weights[quota_str]
-        elif str(quota_int) in quota_weights:
-            weight = quota_weights[str(quota_int)]
-        elif quota in quota_weights:
-            weight = quota_weights[quota]
-        elif quota_int in quota_weights:
-            weight = quota_weights[quota_int]
-        else:
-            # 自定义额度：额度越大概率越低
-            weight = max(1, int(100 / quota))
+        # 尝试多种格式匹配
+        for key in [quota_str, str(int(quota)) if quota == int(quota) else None]:
+            if key and key in quota_weights:
+                weight = float(quota_weights[key])
+                break
+        
+        if weight is None:
+            weight = max(0.1, 100 / quota)
         
         choices.append((quota, coupons))
         weights.append(weight)
@@ -205,6 +188,16 @@ def get_random_coupon(db: Session):
     
     selected = random.choices(choices, weights=weights, k=1)[0]
     return random.choice(selected[1])
+
+def format_cooldown(minutes: int) -> str:
+    """格式化冷却时间显示"""
+    if minutes >= 60:
+        h = minutes // 60
+        m = minutes % 60
+        if m > 0:
+            return f"{h}小时{m}分钟"
+        return f"{h}小时"
+    return f"{minutes}分钟"
 
 # ============ 用户 API ============
 @app.post("/api/verify")
@@ -243,16 +236,29 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
     if not await verify_user_identity(user_id, username, api_key):
         raise HTTPException(status_code=401, detail="API Key 无效")
     
-    cooldown_hours = get_cooldown_hours(db)
+    cooldown_minutes = get_cooldown_minutes(db)
+    claim_times = get_claim_times(db)
     now = now_utc()
-    last_claim = db.query(ClaimRecord).filter(ClaimRecord.user_id == user_id).order_by(ClaimRecord.claim_time.desc()).first()
+    
+    # 获取冷却周期内的领取记录
+    cooldown_start = now - timedelta(minutes=cooldown_minutes)
+    recent_claims = db.query(ClaimRecord).filter(
+        ClaimRecord.user_id == user_id,
+        ClaimRecord.claim_time >= cooldown_start
+    ).order_by(ClaimRecord.claim_time.desc()).all()
+    
+    claims_in_period = len(recent_claims)
+    remaining_claims = max(0, claim_times - claims_in_period)
     
     can_claim = True
     cooldown_text = None
     
-    if last_claim:
-        last_time = last_claim.claim_time.replace(tzinfo=timezone.utc) if last_claim.claim_time.tzinfo is None else last_claim.claim_time
-        next_claim_time = last_time + timedelta(hours=cooldown_hours)
+    if claims_in_period >= claim_times and recent_claims:
+        # 已用完本周期次数，计算下次可领取时间
+        oldest_claim = recent_claims[-1]
+        oldest_time = oldest_claim.claim_time.replace(tzinfo=timezone.utc) if oldest_claim.claim_time.tzinfo is None else oldest_claim.claim_time
+        next_claim_time = oldest_time + timedelta(minutes=cooldown_minutes)
+        
         if now < next_claim_time:
             can_claim = False
             remaining = next_claim_time - now
@@ -260,7 +266,10 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
             h = total_seconds // 3600
             m = (total_seconds % 3600) // 60
             s = total_seconds % 60
-            cooldown_text = f"{h}小时 {m}分钟 {s}秒"
+            if h > 0:
+                cooldown_text = f"{h}小时 {m}分钟 {s}秒"
+            else:
+                cooldown_text = f"{m}分钟 {s}秒"
     
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     if available == 0:
@@ -275,6 +284,8 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
             "can_claim": can_claim,
             "cooldown_text": cooldown_text,
             "available_count": available,
+            "remaining_claims": remaining_claims,
+            "claim_times": claim_times,
             "history": [
                 {
                     "coupon_code": r.coupon_code,
@@ -302,18 +313,31 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     if not await verify_user_identity(user_id, username, api_key):
         raise HTTPException(status_code=401, detail="API Key 无效")
     
-    cooldown_hours = get_cooldown_hours(db)
+    cooldown_minutes = get_cooldown_minutes(db)
+    claim_times = get_claim_times(db)
     now = now_utc()
-    last_claim = db.query(ClaimRecord).filter(ClaimRecord.user_id == user_id).order_by(ClaimRecord.claim_time.desc()).first()
     
-    if last_claim:
-        last_time = last_claim.claim_time.replace(tzinfo=timezone.utc) if last_claim.claim_time.tzinfo is None else last_claim.claim_time
-        next_claim_time = last_time + timedelta(hours=cooldown_hours)
+    # 检查冷却周期内的领取次数
+    cooldown_start = now - timedelta(minutes=cooldown_minutes)
+    recent_claims = db.query(ClaimRecord).filter(
+        ClaimRecord.user_id == user_id,
+        ClaimRecord.claim_time >= cooldown_start
+    ).order_by(ClaimRecord.claim_time.desc()).all()
+    
+    if len(recent_claims) >= claim_times:
+        oldest_claim = recent_claims[-1]
+        oldest_time = oldest_claim.claim_time.replace(tzinfo=timezone.utc) if oldest_claim.claim_time.tzinfo is None else oldest_claim.claim_time
+        next_claim_time = oldest_time + timedelta(minutes=cooldown_minutes)
+        
         if now < next_claim_time:
             remaining = next_claim_time - now
-            h = int(remaining.total_seconds()) // 3600
-            m = (int(remaining.total_seconds()) % 3600) // 60
-            raise HTTPException(status_code=400, detail=f"冷却中，请在 {h}小时 {m}分钟 后再试")
+            total_min = int(remaining.total_seconds()) // 60
+            if total_min >= 60:
+                h = total_min // 60
+                m = total_min % 60
+                raise HTTPException(status_code=400, detail=f"冷却中，请在 {h}小时 {m}分钟 后再试")
+            else:
+                raise HTTPException(status_code=400, detail=f"冷却中，请在 {total_min}分钟 后再试")
     
     coupon = get_random_coupon(db)
     if not coupon:
@@ -334,7 +358,10 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     db.add(record)
     db.commit()
     
-    return {"success": True, "data": {"coupon_code": coupon.coupon_code, "quota": coupon.quota_dollars}}
+    # 返回剩余次数
+    remaining = claim_times - len(recent_claims) - 1
+    
+    return {"success": True, "data": {"coupon_code": coupon.coupon_code, "quota": coupon.quota_dollars, "remaining_claims": remaining}}
 
 # ============ 管理员 API ============
 @app.post("/api/admin/login")
@@ -386,6 +413,116 @@ async def upload_txt(password: str = Form(...), quota: float = Form(1), file: Up
     total = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     return {"success": True, "message": f"成功添加 {added} 个兑换码，当前可用: {total} 个"}
 
+@app.get("/api/admin/coupons")
+async def get_coupons(password: str, page: int = 1, per_page: int = 20, status: str = "all", search: str = "", db: Session = Depends(get_db)):
+    """获取兑换码列表"""
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="密码错误")
+    
+    query = db.query(CouponPool)
+    
+    # 状态筛选
+    if status == "available":
+        query = query.filter(CouponPool.is_claimed == False)
+    elif status == "claimed":
+        query = query.filter(CouponPool.is_claimed == True)
+    
+    # 搜索
+    if search:
+        query = query.filter(CouponPool.coupon_code.contains(search))
+    
+    total = query.count()
+    coupons = query.order_by(CouponPool.id.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    
+    return {
+        "success": True,
+        "data": {
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": (total + per_page - 1) // per_page,
+            "coupons": [
+                {
+                    "id": c.id,
+                    "code": c.coupon_code,
+                    "quota": c.quota_dollars,
+                    "is_claimed": c.is_claimed,
+                    "claimed_by": c.claimed_by_username,
+                    "claimed_at": c.claimed_at.strftime("%Y-%m-%d %H:%M") if c.claimed_at else None,
+                    "created_at": c.created_at.strftime("%Y-%m-%d %H:%M") if c.created_at else None
+                } for c in coupons
+            ]
+        }
+    }
+
+@app.post("/api/admin/delete-coupon")
+async def delete_coupon(request: Request, db: Session = Depends(get_db)):
+    """删除单个兑换码"""
+    body = await request.json()
+    password = body.get("password", "")
+    coupon_id = body.get("id")
+    
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="密码错误")
+    
+    coupon = db.query(CouponPool).filter(CouponPool.id == coupon_id).first()
+    if not coupon:
+        raise HTTPException(status_code=404, detail="兑换码不存在")
+    
+    db.delete(coupon)
+    db.commit()
+    
+    return {"success": True, "message": "删除成功"}
+
+@app.post("/api/admin/delete-coupons-batch")
+async def delete_coupons_batch(request: Request, db: Session = Depends(get_db)):
+    """批量删除兑换码"""
+    body = await request.json()
+    password = body.get("password", "")
+    ids = body.get("ids", [])
+    delete_type = body.get("type", "selected")  # selected, all_available, all_claimed, all
+    
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="密码错误")
+    
+    if delete_type == "selected":
+        deleted = db.query(CouponPool).filter(CouponPool.id.in_(ids)).delete(synchronize_session=False)
+    elif delete_type == "all_available":
+        deleted = db.query(CouponPool).filter(CouponPool.is_claimed == False).delete(synchronize_session=False)
+    elif delete_type == "all_claimed":
+        deleted = db.query(CouponPool).filter(CouponPool.is_claimed == True).delete(synchronize_session=False)
+    elif delete_type == "all":
+        deleted = db.query(CouponPool).delete(synchronize_session=False)
+    else:
+        deleted = 0
+    
+    db.commit()
+    
+    return {"success": True, "message": f"成功删除 {deleted} 个兑换码"}
+
+@app.post("/api/admin/update-coupon")
+async def update_coupon(request: Request, db: Session = Depends(get_db)):
+    """更新兑换码信息"""
+    body = await request.json()
+    password = body.get("password", "")
+    coupon_id = body.get("id")
+    
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="密码错误")
+    
+    coupon = db.query(CouponPool).filter(CouponPool.id == coupon_id).first()
+    if not coupon:
+        raise HTTPException(status_code=404, detail="兑换码不存在")
+    
+    if "quota" in body:
+        coupon.quota_dollars = float(body["quota"])
+    if "code" in body:
+        coupon.coupon_code = body["code"]
+    
+    db.commit()
+    
+    return {"success": True, "message": "更新成功"}
+
 @app.get("/api/admin/stats")
 async def get_stats(password: str, db: Session = Depends(get_db)):
     if password != ADMIN_PASSWORD:
@@ -395,7 +532,6 @@ async def get_stats(password: str, db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     claimed = db.query(CouponPool).filter(CouponPool.is_claimed == True).count()
     
-    # 获取所有不同额度
     from sqlalchemy import distinct
     all_quotas = db.query(distinct(CouponPool.quota_dollars)).all()
     all_quotas = sorted([q[0] for q in all_quotas])
@@ -409,8 +545,8 @@ async def get_stats(password: str, db: Session = Depends(get_db)):
     
     recent = db.query(ClaimRecord).order_by(ClaimRecord.claim_time.desc()).limit(50).all()
     
-    # 获取当前配置
-    cooldown_hours = get_cooldown_hours(db)
+    cooldown_minutes = get_cooldown_minutes(db)
+    claim_times = get_claim_times(db)
     quota_weights = get_quota_weights(db)
     
     return {
@@ -420,7 +556,8 @@ async def get_stats(password: str, db: Session = Depends(get_db)):
             "available": available,
             "claimed": claimed,
             "quota_stats": quota_stats,
-            "cooldown_hours": cooldown_hours,
+            "cooldown_minutes": cooldown_minutes,
+            "claim_times": claim_times,
             "quota_weights": quota_weights,
             "recent_claims": [
                 {
@@ -436,29 +573,34 @@ async def get_stats(password: str, db: Session = Depends(get_db)):
 
 @app.post("/api/admin/update-config")
 async def update_config(request: Request, db: Session = Depends(get_db)):
-    """更新系统配置"""
     body = await request.json()
     password = body.get("password", "")
     
     if password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
     
-    # 更新冷却时间
-    if "cooldown_hours" in body:
+    if "cooldown_minutes" in body:
         try:
-            hours = int(body["cooldown_hours"])
-            if hours < 1:
-                raise HTTPException(status_code=400, detail="冷却时间至少为1小时")
-            set_config(db, "cooldown_hours", str(hours))
+            minutes = int(body["cooldown_minutes"])
+            if minutes < 1:
+                raise HTTPException(status_code=400, detail="冷却时间至少为1分钟")
+            set_config(db, "cooldown_minutes", str(minutes))
         except ValueError:
             raise HTTPException(status_code=400, detail="冷却时间必须是整数")
     
-    # 更新概率权重
+    if "claim_times" in body:
+        try:
+            times = int(body["claim_times"])
+            if times < 1:
+                raise HTTPException(status_code=400, detail="领取次数至少为1次")
+            set_config(db, "claim_times", str(times))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="领取次数必须是整数")
+    
     if "quota_weights" in body:
         weights = body["quota_weights"]
         if not isinstance(weights, dict):
             raise HTTPException(status_code=400, detail="概率配置格式错误")
-        # 验证权重值
         for k, v in weights.items():
             if not isinstance(v, (int, float)) or v < 0:
                 raise HTTPException(status_code=400, detail=f"概率权重必须是非负数: {k}={v}")
@@ -469,31 +611,41 @@ async def update_config(request: Request, db: Session = Depends(get_db)):
 @app.get("/api/stats/public")
 async def get_public_stats(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
-    cooldown_hours = get_cooldown_hours(db)
-    return {"available": available, "cooldown_hours": cooldown_hours}
+    cooldown_minutes = get_cooldown_minutes(db)
+    claim_times = get_claim_times(db)
+    return {
+        "available": available, 
+        "cooldown_minutes": cooldown_minutes,
+        "cooldown_text": format_cooldown(cooldown_minutes),
+        "claim_times": claim_times
+    }
 
 # ============ 页面路由 ============
 @app.get("/", response_class=HTMLResponse)
 async def index(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
-    cooldown_hours = get_cooldown_hours(db)
+    cooldown_minutes = get_cooldown_minutes(db)
+    claim_times = get_claim_times(db)
     html = HOME_PAGE
     html = html.replace("{{AVAILABLE}}", str(available))
     html = html.replace("{{SITE_NAME}}", SITE_NAME)
     html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
-    html = html.replace("{{COOLDOWN}}", str(cooldown_hours))
+    html = html.replace("{{COOLDOWN_TEXT}}", format_cooldown(cooldown_minutes))
+    html = html.replace("{{CLAIM_TIMES}}", str(claim_times))
     html = html.replace("{{COUPON_SITE_URL}}", COUPON_SITE_URL)
     return html
 
 @app.get("/claim", response_class=HTMLResponse)
 async def claim_page(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
-    cooldown_hours = get_cooldown_hours(db)
+    cooldown_minutes = get_cooldown_minutes(db)
+    claim_times = get_claim_times(db)
     html = CLAIM_PAGE
     html = html.replace("{{AVAILABLE}}", str(available))
     html = html.replace("{{SITE_NAME}}", SITE_NAME)
     html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
-    html = html.replace("{{COOLDOWN}}", str(cooldown_hours))
+    html = html.replace("{{COOLDOWN_TEXT}}", format_cooldown(cooldown_minutes))
+    html = html.replace("{{CLAIM_TIMES}}", str(claim_times))
     return html
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -622,7 +774,7 @@ resp = client.chat.completions.create(
                 <div class="flex flex-col md:flex-row items-center justify-between gap-6">
                     <div>
                         <h3 class="text-xl font-bold mb-2">免费领取API额度</h3>
-                        <p class="text-gray-400 mb-3">每 <span id="cd-hours">{{COOLDOWN}}</span> 小时可领取一次，随机获得对应额度的兑换码</p>
+                        <p class="text-gray-400 mb-3">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次，随机获得对应额度的兑换码</p>
                         <span class="inline-block bg-green-900/40 text-green-400 px-4 py-1.5 rounded-full border border-green-800 text-sm">📦 当前可领: <b id="avail-cnt">{{AVAILABLE}}</b> 个</span>
                     </div>
                     <a href="/claim" target="_top" class="btn btn-primary text-lg px-8 py-3">🎁 立即领取 →</a>
@@ -662,7 +814,6 @@ resp = client.chat.completions.create(
             btn.textContent='已复制';btn.classList.remove('bg-blue-600');btn.classList.add('bg-green-600');
             setTimeout(function(){btn.textContent='复制';btn.classList.remove('bg-green-600');btn.classList.add('bg-blue-600');},1500);
         }
-        // 动态获取统计
         (function(){
             var xhr = new XMLHttpRequest();
             xhr.open('GET', '/api/stats/public', true);
@@ -671,7 +822,8 @@ resp = client.chat.completions.create(
                     try{
                         var d = JSON.parse(xhr.responseText);
                         document.getElementById('avail-cnt').textContent = d.available;
-                        document.getElementById('cd-hours').textContent = d.cooldown_hours;
+                        document.getElementById('cd-text').textContent = d.cooldown_text;
+                        document.getElementById('claim-times').textContent = d.claim_times;
                     }catch(e){}
                 }
             };
@@ -736,7 +888,10 @@ CLAIM_PAGE = '''<!DOCTYPE html>
             <div class="card p-6 mb-4">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="font-semibold">领取状态</h2>
-                    <span id="badge" class="px-3 py-1 rounded-full text-sm"></span>
+                    <div class="flex items-center gap-2">
+                        <span id="remainBadge" class="px-2 py-1 rounded text-xs bg-purple-900/50 text-purple-400 border border-purple-700"></span>
+                        <span id="badge" class="px-3 py-1 rounded-full text-sm"></span>
+                    </div>
                 </div>
                 <div class="text-center py-4">
                     <button type="button" id="claimBtn" class="btn-c" onclick="doClaim()">🎰 抽取兑换券</button>
@@ -760,18 +915,16 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     </main>
 
     <footer class="text-center py-6 text-gray-600 text-sm">
-        每 <span id="cd-hours">{{COOLDOWN}}</span> 小时可领取一次 | <a href="{{NEW_API_URL}}/" class="text-blue-400 hover:underline">返回首页</a> | <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400 hover:underline">钱包充值</a>
+        每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次 | <a href="{{NEW_API_URL}}/" class="text-blue-400 hover:underline">返回首页</a> | <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400 hover:underline">钱包充值</a>
     </footer>
 
     <script>
     var ud = null;
-    var cdHours = {{COOLDOWN}};
     var NEW_API_URL = '{{NEW_API_URL}}';
 
     (function(){
         var s = localStorage.getItem('coupon_user');
         if(s){ try{ ud = JSON.parse(s); document.getElementById('uid').value = ud.user_id||''; document.getElementById('uname').value = ud.username||''; document.getElementById('ukey').value = ud.api_key||''; }catch(e){} }
-        // 获取动态配置
         var xhr = new XMLHttpRequest();
         xhr.open('GET', '/api/stats/public', true);
         xhr.onreadystatechange = function(){
@@ -779,8 +932,8 @@ CLAIM_PAGE = '''<!DOCTYPE html>
                 try{
                     var d = JSON.parse(xhr.responseText);
                     document.getElementById('cnt').textContent = d.available;
-                    document.getElementById('cd-hours').textContent = d.cooldown_hours;
-                    cdHours = d.cooldown_hours;
+                    document.getElementById('cd-text').textContent = d.cooldown_text;
+                    document.getElementById('claim-times').textContent = d.claim_times;
                 }catch(e){}
             }
         };
@@ -856,7 +1009,11 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         document.getElementById('cnt').textContent = d.available_count;
         var btn = document.getElementById('claimBtn');
         var badge = document.getElementById('badge');
+        var remainBadge = document.getElementById('remainBadge');
         var msg = document.getElementById('cdMsg');
+        
+        remainBadge.textContent = '剩余 ' + d.remaining_claims + '/' + d.claim_times + ' 次';
+        
         if(d.can_claim){
             btn.disabled = false;
             badge.textContent = '✅ 可领取'; badge.className = 'px-3 py-1 rounded-full text-sm bg-green-900/50 text-green-400 border border-green-700';
@@ -930,40 +1087,42 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     <style>
         body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui,sans-serif}
         .card{background:#12121a;border:1px solid #1f1f2e;border-radius:12px}
-        .ipt{background:#0d0d12;border:1px solid #1f1f2e;color:#e0e0e0;border-radius:8px;padding:12px 16px;width:100%}
+        .ipt{background:#0d0d12;border:1px solid #1f1f2e;color:#e0e0e0;border-radius:8px;padding:10px 14px;width:100%}
         .ipt:focus{border-color:#3b82f6;outline:none}
-        .btn{padding:12px 24px;border-radius:8px;font-weight:600;border:none;cursor:pointer;width:100%}
-        .btn-blue{background:#3b82f6;color:#fff}
-        .btn-blue:hover{background:#2563eb}
-        .btn-green{background:#10b981;color:#fff}
-        .btn-green:hover{background:#059669}
-        .btn-purple{background:#8b5cf6;color:#fff}
-        .btn-purple:hover{background:#7c3aed}
+        .btn{padding:10px 20px;border-radius:8px;font-weight:600;border:none;cursor:pointer}
+        .btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
+        .btn-green{background:#10b981;color:#fff}.btn-green:hover{background:#059669}
+        .btn-purple{background:#8b5cf6;color:#fff}.btn-purple:hover{background:#7c3aed}
+        .btn-red{background:#ef4444;color:#fff}.btn-red:hover{background:#dc2626}
+        .btn-gray{background:#374151;color:#fff}.btn-gray:hover{background:#4b5563}
         #overlay{position:fixed;inset:0;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:100}
         #toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;z-index:200;display:none}
-        .weight-input{width:60px;text-align:center;padding:8px;font-size:14px}
+        .tab-btn{padding:8px 16px;border-radius:8px;cursor:pointer;transition:all .2s}
+        .tab-btn.active{background:#3b82f6;color:#fff}
+        .tab-btn:not(.active){background:#1f1f2e;color:#9ca3af}
+        .tab-btn:not(.active):hover{background:#2a2a3a}
+        .coupon-row{display:grid;grid-template-columns:1fr 80px 100px 120px 80px;gap:8px;padding:10px;border-bottom:1px solid #1f1f2e;align-items:center}
+        .coupon-row:hover{background:#1a1a24}
+        .weight-row{display:flex;align-items:center;gap:8px;padding:8px;background:#1a1a24;border-radius:8px;margin-bottom:8px}
     </style>
 </head>
 <body class="min-h-screen">
-    <!-- 登录遮罩 -->
     <div id="overlay">
         <div class="card p-8 w-full max-w-sm mx-4">
             <div class="text-center mb-6">
                 <div class="text-4xl mb-2">🔐</div>
                 <h1 class="text-xl font-bold">管理后台</h1>
-                <p class="text-gray-500 text-sm">请输入管理员密码</p>
             </div>
             <input type="password" id="loginPwd" class="ipt mb-4" placeholder="管理员密码">
-            <button type="button" class="btn btn-blue" onclick="doLogin()">登录</button>
+            <button type="button" class="btn btn-blue w-full" onclick="doLogin()">登录</button>
             <a href="/" class="block text-center text-gray-500 text-sm mt-4 hover:text-blue-400">← 返回首页</a>
             <p id="loginError" class="text-red-500 text-center text-sm mt-2" style="display:none"></p>
         </div>
     </div>
 
-    <!-- 管理界面 -->
     <div id="adminMain" style="display:none">
         <nav class="border-b border-gray-800 py-4 px-6">
-            <div class="max-w-6xl mx-auto flex justify-between items-center">
+            <div class="max-w-7xl mx-auto flex justify-between items-center">
                 <h1 class="font-bold text-xl">🔧 管理后台</h1>
                 <div class="flex items-center gap-4">
                     <a href="/" class="text-gray-400 hover:text-white text-sm">← 首页</a>
@@ -972,76 +1131,143 @@ ADMIN_PAGE = '''<!DOCTYPE html>
             </div>
         </nav>
 
-        <main class="max-w-6xl mx-auto px-4 py-8">
-            <div class="grid lg:grid-cols-3 gap-6">
-                <div class="lg:col-span-2 space-y-6">
-                    <!-- 添加兑换码 -->
-                    <div class="card p-6">
-                        <h2 class="font-semibold mb-4">📤 添加兑换码</h2>
-                        <div class="grid grid-cols-5 gap-2 mb-4">
-                            <button type="button" onclick="setQuota(1)" class="bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold hover:opacity-80">$1</button>
-                            <button type="button" onclick="setQuota(5)" class="bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold hover:opacity-80">$5</button>
-                            <button type="button" onclick="setQuota(10)" class="bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold hover:opacity-80">$10</button>
-                            <button type="button" onclick="setQuota(50)" class="bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold hover:opacity-80">$50</button>
-                            <button type="button" onclick="setQuota(100)" class="bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold hover:opacity-80">$100</button>
-                        </div>
-                        <div class="flex items-center gap-2 mb-4">
-                            <span class="text-gray-400">额度:</span>
-                            <input type="number" id="quotaVal" value="1" class="w-20 ipt text-center font-bold">
-                            <span class="text-gray-400">美元</span>
-                        </div>
-                        <div class="mb-4">
-                            <label class="block text-sm text-gray-400 mb-2">上传TXT文件</label>
-                            <input type="file" id="txtFile" accept=".txt" class="ipt">
-                        </div>
-                        <button type="button" class="btn btn-blue mb-4" onclick="doUpload()">上传文件</button>
-                        <hr class="border-gray-700 my-4">
-                        <div>
-                            <label class="block text-sm text-gray-400 mb-2">或手动粘贴（每行一个）</label>
-                            <textarea id="codesText" rows="4" class="ipt font-mono text-sm" placeholder="每行一个兑换码"></textarea>
-                        </div>
-                        <button type="button" class="btn btn-green mt-3" onclick="doAddCodes()">添加兑换码</button>
-                    </div>
+        <!-- 标签页导航 -->
+        <div class="max-w-7xl mx-auto px-4 py-4">
+            <div class="flex gap-2 flex-wrap">
+                <button class="tab-btn active" onclick="switchTab('overview')">📊 总览</button>
+                <button class="tab-btn" onclick="switchTab('coupons')">🎫 兑换码管理</button>
+                <button class="tab-btn" onclick="switchTab('add')">➕ 添加兑换码</button>
+                <button class="tab-btn" onclick="switchTab('config')">⚙️ 系统配置</button>
+            </div>
+        </div>
 
-                    <!-- 系统配置 -->
-                    <div class="card p-6">
-                        <h2 class="font-semibold mb-4">⚙️ 系统配置</h2>
-                        
-                        <!-- 冷却时间 -->
-                        <div class="mb-6">
-                            <label class="block text-sm text-gray-400 mb-2">领取冷却时间（小时）</label>
-                            <div class="flex items-center gap-3">
-                                <input type="number" id="cooldownHours" min="1" max="168" class="w-24 ipt text-center font-bold">
-                                <span class="text-gray-500">小时</span>
-                                <button type="button" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm" onclick="saveCooldown()">保存</button>
-                            </div>
+        <main class="max-w-7xl mx-auto px-4 pb-8">
+            <!-- 总览 -->
+            <div id="tab-overview" class="tab-content">
+                <div class="grid lg:grid-cols-3 gap-6">
+                    <div class="lg:col-span-2">
+                        <div class="card p-6">
+                            <h2 class="font-semibold mb-4">📊 统计数据</h2>
+                            <div id="statsBox">加载中...</div>
                         </div>
-                        
-                        <!-- 概率配置 -->
-                        <div>
-                            <label class="block text-sm text-gray-400 mb-3">抽奖概率权重（数值越大概率越高）</label>
-                            <div id="weightsContainer" class="space-y-2"></div>
-                            <div class="mt-4 flex gap-2">
-                                <input type="number" id="newQuotaKey" placeholder="额度" class="w-20 ipt text-center text-sm">
-                                <input type="number" id="newQuotaWeight" placeholder="权重" class="w-20 ipt text-center text-sm">
-                                <button type="button" class="bg-green-600 hover:bg-green-700 text-white px-3 py-2 rounded text-sm" onclick="addWeight()">添加</button>
-                            </div>
-                            <button type="button" class="btn btn-purple mt-4" onclick="saveWeights()">保存概率配置</button>
+                    </div>
+                    <div>
+                        <div class="card p-6">
+                            <h2 class="font-semibold mb-4">📋 最近领取</h2>
+                            <div id="recentBox" class="max-h-96 overflow-y-auto space-y-2 text-sm"></div>
                         </div>
                     </div>
                 </div>
+            </div>
 
-                <div class="space-y-6">
-                    <div class="card p-6">
-                        <div class="flex justify-between items-center mb-4">
-                            <h2 class="font-semibold">📊 统计</h2>
-                            <button type="button" class="text-blue-400 text-sm" onclick="loadStats()">刷新</button>
+            <!-- 兑换码管理 -->
+            <div id="tab-coupons" class="tab-content" style="display:none">
+                <div class="card p-6">
+                    <div class="flex flex-wrap justify-between items-center gap-4 mb-4">
+                        <h2 class="font-semibold">🎫 兑换码列表</h2>
+                        <div class="flex gap-2 flex-wrap">
+                            <select id="couponStatus" class="ipt w-auto" onchange="loadCoupons(1)">
+                                <option value="all">全部</option>
+                                <option value="available">可用</option>
+                                <option value="claimed">已领取</option>
+                            </select>
+                            <input type="text" id="couponSearch" class="ipt w-40" placeholder="搜索兑换码..." onkeyup="if(event.key==='Enter')loadCoupons(1)">
+                            <button class="btn btn-blue" onclick="loadCoupons(1)">搜索</button>
                         </div>
-                        <div id="statsBox">加载中...</div>
                     </div>
+                    
+                    <!-- 批量操作 -->
+                    <div class="flex gap-2 mb-4 flex-wrap">
+                        <button class="btn btn-gray text-sm" onclick="selectAllCoupons()">全选当页</button>
+                        <button class="btn btn-red text-sm" onclick="deleteSelected()">删除选中</button>
+                        <button class="btn btn-red text-sm" onclick="deleteBatch('all_claimed')">删除所有已领取</button>
+                        <button class="btn btn-red text-sm" onclick="deleteBatch('all_available')">删除所有可用</button>
+                    </div>
+                    
+                    <!-- 表头 -->
+                    <div class="coupon-row text-gray-500 text-sm font-semibold border-b-2 border-gray-700">
+                        <div class="flex items-center gap-2"><input type="checkbox" id="selectAllCheck" onchange="toggleSelectAll()"> 兑换码</div>
+                        <div>额度</div>
+                        <div>状态</div>
+                        <div>领取信息</div>
+                        <div>操作</div>
+                    </div>
+                    
+                    <div id="couponList"></div>
+                    
+                    <!-- 分页 -->
+                    <div id="pagination" class="flex justify-center gap-2 mt-4"></div>
+                </div>
+            </div>
+
+            <!-- 添加兑换码 -->
+            <div id="tab-add" class="tab-content" style="display:none">
+                <div class="card p-6">
+                    <h2 class="font-semibold mb-4">➕ 添加兑换码</h2>
+                    <div class="grid grid-cols-5 gap-2 mb-4">
+                        <button type="button" onclick="setQuota(1)" class="bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold hover:opacity-80">$1</button>
+                        <button type="button" onclick="setQuota(5)" class="bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold hover:opacity-80">$5</button>
+                        <button type="button" onclick="setQuota(10)" class="bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold hover:opacity-80">$10</button>
+                        <button type="button" onclick="setQuota(50)" class="bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold hover:opacity-80">$50</button>
+                        <button type="button" onclick="setQuota(100)" class="bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold hover:opacity-80">$100</button>
+                    </div>
+                    <div class="flex items-center gap-2 mb-4">
+                        <span class="text-gray-400">额度:</span>
+                        <input type="number" id="quotaVal" value="1" step="0.01" min="0.01" class="w-24 ipt text-center font-bold">
+                        <span class="text-gray-400">美元（支持小数）</span>
+                    </div>
+                    <div class="mb-4">
+                        <label class="block text-sm text-gray-400 mb-2">上传TXT文件</label>
+                        <input type="file" id="txtFile" accept=".txt" class="ipt">
+                    </div>
+                    <button type="button" class="btn btn-blue w-full mb-4" onclick="doUpload()">上传文件</button>
+                    <hr class="border-gray-700 my-4">
+                    <div>
+                        <label class="block text-sm text-gray-400 mb-2">或手动粘贴（每行一个）</label>
+                        <textarea id="codesText" rows="6" class="ipt font-mono text-sm" placeholder="每行一个兑换码"></textarea>
+                    </div>
+                    <button type="button" class="btn btn-green w-full mt-3" onclick="doAddCodes()">添加兑换码</button>
+                </div>
+            </div>
+
+            <!-- 系统配置 -->
+            <div id="tab-config" class="tab-content" style="display:none">
+                <div class="grid lg:grid-cols-2 gap-6">
+                    <!-- 冷却时间配置 -->
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4">📋 最近领取</h2>
-                        <div id="recentBox" class="max-h-80 overflow-y-auto space-y-2 text-sm"></div>
+                        <h2 class="font-semibold mb-4">⏱️ 冷却时间设置</h2>
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-sm text-gray-400 mb-2">冷却时间</label>
+                                <div class="flex items-center gap-2">
+                                    <input type="number" id="cooldownMinutes" min="1" class="w-24 ipt text-center font-bold">
+                                    <span class="text-gray-400">分钟</span>
+                                </div>
+                                <p class="text-xs text-gray-500 mt-1">提示：60分钟=1小时，480分钟=8小时</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm text-gray-400 mb-2">每周期可领取次数</label>
+                                <div class="flex items-center gap-2">
+                                    <input type="number" id="claimTimes" min="1" max="100" class="w-24 ipt text-center font-bold">
+                                    <span class="text-gray-400">次</span>
+                                </div>
+                                <p class="text-xs text-gray-500 mt-1">用户在冷却时间内可领取的次数</p>
+                            </div>
+                            <button class="btn btn-blue w-full" onclick="saveCooldownConfig()">保存冷却配置</button>
+                        </div>
+                    </div>
+
+                    <!-- 概率配置 -->
+                    <div class="card p-6">
+                        <h2 class="font-semibold mb-4">🎰 概率权重设置</h2>
+                        <p class="text-xs text-gray-500 mb-4">权重越大概率越高，支持小数。例如：权重0.1表示极低概率</p>
+                        <div id="weightsContainer" class="max-h-64 overflow-y-auto mb-4"></div>
+                        <div class="flex gap-2 mb-4">
+                            <input type="number" id="newQuotaKey" step="0.01" placeholder="额度" class="w-24 ipt text-center text-sm">
+                            <input type="number" id="newQuotaWeight" step="0.01" placeholder="权重" class="w-24 ipt text-center text-sm">
+                            <button class="btn btn-green" onclick="addWeight()">添加</button>
+                        </div>
+                        <button class="btn btn-purple w-full" onclick="saveWeights()">保存概率配置</button>
                     </div>
                 </div>
             </div>
@@ -1053,38 +1279,25 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     <script>
     var adminPwd = '';
     var currentWeights = {};
+    var selectedCoupons = new Set();
+    var currentPage = 1;
 
-    // 页面加载时检查session
     (function(){
         var saved = sessionStorage.getItem('admin_pwd');
-        if(saved){
-            adminPwd = saved;
-            verifyAndShow();
-        }
-        // 回车登录
-        document.getElementById('loginPwd').addEventListener('keydown', function(e){
-            if(e.key === 'Enter') doLogin();
-        });
+        if(saved){ adminPwd = saved; verifyAndShow(); }
+        document.getElementById('loginPwd').addEventListener('keydown', function(e){ if(e.key === 'Enter') doLogin(); });
     })();
 
     function toast(msg, ok){
         var t = document.getElementById('toast');
-        t.textContent = msg;
-        t.style.display = 'block';
-        t.style.background = ok ? '#10b981' : '#ef4444';
+        t.textContent = msg; t.style.display = 'block'; t.style.background = ok ? '#10b981' : '#ef4444';
         setTimeout(function(){ t.style.display = 'none'; }, 3000);
     }
 
     function doLogin(){
         var pwd = document.getElementById('loginPwd').value;
         var errEl = document.getElementById('loginError');
-        
-        if(!pwd){
-            errEl.textContent = '请输入密码';
-            errEl.style.display = 'block';
-            return;
-        }
-        
+        if(!pwd){ errEl.textContent = '请输入密码'; errEl.style.display = 'block'; return; }
         errEl.style.display = 'none';
         
         var xhr = new XMLHttpRequest();
@@ -1093,20 +1306,12 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         xhr.onreadystatechange = function(){
             if(xhr.readyState === 4){
                 if(xhr.status === 200){
-                    adminPwd = pwd;
-                    sessionStorage.setItem('admin_pwd', pwd);
+                    adminPwd = pwd; sessionStorage.setItem('admin_pwd', pwd);
                     document.getElementById('overlay').style.display = 'none';
                     document.getElementById('adminMain').style.display = 'block';
                     loadStats();
-                } else {
-                    errEl.textContent = '密码错误';
-                    errEl.style.display = 'block';
-                }
+                } else { errEl.textContent = '密码错误'; errEl.style.display = 'block'; }
             }
-        };
-        xhr.onerror = function(){
-            errEl.textContent = '网络错误';
-            errEl.style.display = 'block';
         };
         xhr.send(JSON.stringify({password: pwd}));
     }
@@ -1120,44 +1325,37 @@ ADMIN_PAGE = '''<!DOCTYPE html>
                     document.getElementById('overlay').style.display = 'none';
                     document.getElementById('adminMain').style.display = 'block';
                     loadStats();
-                } else {
-                    sessionStorage.removeItem('admin_pwd');
-                    adminPwd = '';
-                }
+                } else { sessionStorage.removeItem('admin_pwd'); adminPwd = ''; }
             }
         };
         xhr.send();
     }
 
-    function doLogout(){
-        sessionStorage.removeItem('admin_pwd');
-        adminPwd = '';
-        location.reload();
+    function doLogout(){ sessionStorage.removeItem('admin_pwd'); adminPwd = ''; location.reload(); }
+
+    function switchTab(tab){
+        document.querySelectorAll('.tab-content').forEach(function(el){ el.style.display = 'none'; });
+        document.querySelectorAll('.tab-btn').forEach(function(el){ el.classList.remove('active'); });
+        document.getElementById('tab-' + tab).style.display = 'block';
+        event.target.classList.add('active');
+        
+        if(tab === 'coupons') loadCoupons(1);
+        if(tab === 'overview') loadStats();
     }
 
-    function setQuota(q){
-        document.getElementById('quotaVal').value = q;
-    }
+    function setQuota(q){ document.getElementById('quotaVal').value = q; }
 
     function doUpload(){
         var q = document.getElementById('quotaVal').value;
         var f = document.getElementById('txtFile').files[0];
         if(!f){ toast('请选择文件', false); return; }
-
-        var fd = new FormData();
-        fd.append('password', adminPwd);
-        fd.append('quota', q);
-        fd.append('file', f);
-
+        var fd = new FormData(); fd.append('password', adminPwd); fd.append('quota', q); fd.append('file', f);
         var xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/admin/upload-txt', true);
         xhr.onreadystatechange = function(){
             if(xhr.readyState === 4){
-                try{
-                    var res = JSON.parse(xhr.responseText);
-                    toast(res.message || res.detail, xhr.status === 200);
-                    if(xhr.status === 200){ loadStats(); document.getElementById('txtFile').value = ''; }
-                }catch(e){ toast('请求失败', false); }
+                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200);
+                if(xhr.status === 200){ loadStats(); document.getElementById('txtFile').value = ''; } }catch(e){ toast('失败', false); }
             }
         };
         xhr.send(fd);
@@ -1168,75 +1366,172 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         var txt = document.getElementById('codesText').value;
         var arr = txt.split('\\n').filter(function(s){ return s.trim(); });
         if(!arr.length){ toast('请输入兑换码', false); return; }
-
         var xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/admin/add-coupons', true);
         xhr.setRequestHeader('Content-Type', 'application/json');
         xhr.onreadystatechange = function(){
             if(xhr.readyState === 4){
-                try{
-                    var res = JSON.parse(xhr.responseText);
-                    toast(res.message || res.detail, xhr.status === 200);
-                    if(xhr.status === 200){ loadStats(); document.getElementById('codesText').value = ''; }
-                }catch(e){ toast('请求失败', false); }
+                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200);
+                if(xhr.status === 200){ loadStats(); document.getElementById('codesText').value = ''; } }catch(e){ toast('失败', false); }
             }
         };
         xhr.send(JSON.stringify({password: adminPwd, quota: q, coupons: arr}));
     }
 
+    // 兑换码管理
+    function loadCoupons(page){
+        currentPage = page;
+        selectedCoupons.clear();
+        var status = document.getElementById('couponStatus').value;
+        var search = document.getElementById('couponSearch').value;
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/api/admin/coupons?password=' + encodeURIComponent(adminPwd) + '&page=' + page + '&status=' + status + '&search=' + encodeURIComponent(search), true);
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4 && xhr.status === 200){
+                try{
+                    var res = JSON.parse(xhr.responseText);
+                    if(res.success) renderCoupons(res.data);
+                }catch(e){}
+            }
+        };
+        xhr.send();
+    }
+
+    function renderCoupons(data){
+        var html = '';
+        data.coupons.forEach(function(c){
+            var statusClass = c.is_claimed ? 'text-gray-500' : 'text-green-400';
+            var statusText = c.is_claimed ? '已领取' : '可用';
+            html += '<div class="coupon-row">';
+            html += '<div class="flex items-center gap-2"><input type="checkbox" data-id="'+c.id+'" onchange="toggleSelect('+c.id+')"> <span class="font-mono text-sm truncate">'+c.code+'</span></div>';
+            html += '<div class="text-blue-400 font-bold">$'+c.quota+'</div>';
+            html += '<div class="'+statusClass+'">'+statusText+'</div>';
+            html += '<div class="text-xs text-gray-500">'+(c.claimed_by ? c.claimed_by + '<br>' + c.claimed_at : '-')+'</div>';
+            html += '<div><button class="text-red-400 hover:text-red-300 text-sm" onclick="deleteCoupon('+c.id+')">删除</button></div>';
+            html += '</div>';
+        });
+        document.getElementById('couponList').innerHTML = html || '<p class="text-gray-500 text-center py-4">暂无数据</p>';
+        
+        // 分页
+        var phtml = '';
+        for(var i = 1; i <= data.pages; i++){
+            phtml += '<button class="px-3 py-1 rounded '+(i===data.page?'bg-blue-600':'bg-gray-700')+'" onclick="loadCoupons('+i+')">'+i+'</button>';
+        }
+        document.getElementById('pagination').innerHTML = phtml;
+    }
+
+    function toggleSelect(id){
+        if(selectedCoupons.has(id)) selectedCoupons.delete(id);
+        else selectedCoupons.add(id);
+    }
+
+    function toggleSelectAll(){
+        var checked = document.getElementById('selectAllCheck').checked;
+        document.querySelectorAll('#couponList input[type=checkbox]').forEach(function(cb){
+            cb.checked = checked;
+            var id = parseInt(cb.dataset.id);
+            if(checked) selectedCoupons.add(id);
+            else selectedCoupons.delete(id);
+        });
+    }
+
+    function selectAllCoupons(){
+        document.getElementById('selectAllCheck').checked = true;
+        toggleSelectAll();
+    }
+
+    function deleteCoupon(id){
+        if(!confirm('确定删除此兑换码？')) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/delete-coupon', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200);
+                if(xhr.status === 200) loadCoupons(currentPage); }catch(e){ toast('失败', false); }
+            }
+        };
+        xhr.send(JSON.stringify({password: adminPwd, id: id}));
+    }
+
+    function deleteSelected(){
+        if(selectedCoupons.size === 0){ toast('请先选择兑换码', false); return; }
+        if(!confirm('确定删除选中的 ' + selectedCoupons.size + ' 个兑换码？')) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/delete-coupons-batch', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200);
+                if(xhr.status === 200) loadCoupons(currentPage); }catch(e){ toast('失败', false); }
+            }
+        };
+        xhr.send(JSON.stringify({password: adminPwd, ids: Array.from(selectedCoupons), type: 'selected'}));
+    }
+
+    function deleteBatch(type){
+        var msg = type === 'all_claimed' ? '所有已领取的兑换码' : '所有可用的兑换码';
+        if(!confirm('确定删除' + msg + '？此操作不可恢复！')) return;
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/delete-coupons-batch', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200);
+                if(xhr.status === 200) loadCoupons(1); }catch(e){ toast('失败', false); }
+            }
+        };
+        xhr.send(JSON.stringify({password: adminPwd, type: type}));
+    }
+
+    // 配置管理
     function renderWeights(weights){
-        currentWeights = weights || {};
+        currentWeights = {};
+        for(var k in weights) currentWeights[k] = weights[k];
+        
         var container = document.getElementById('weightsContainer');
         var html = '';
-        var colors = {'1':'green','5':'blue','10':'purple','50':'orange','100':'red'};
+        var sortedKeys = Object.keys(currentWeights).sort(function(a,b){ return parseFloat(a) - parseFloat(b); });
         
-        for(var k in currentWeights){
-            var color = colors[k] || 'gray';
-            html += '<div class="flex items-center gap-2 bg-'+color+'-900/30 p-2 rounded border border-'+color+'-800">';
-            html += '<span class="text-'+color+'-400 font-bold w-16">$'+k+'</span>';
-            html += '<input type="number" min="0" value="'+currentWeights[k]+'" onchange="updateWeight(\\''+k+'\\', this.value)" class="weight-input ipt">';
+        sortedKeys.forEach(function(k){
+            html += '<div class="weight-row">';
+            html += '<span class="text-blue-400 font-bold w-20">$'+k+'</span>';
+            html += '<input type="number" step="0.01" min="0" value="'+currentWeights[k]+'" onchange="updateWeight(\\''+k+'\\', this.value)" class="w-20 ipt text-center text-sm">';
             html += '<span class="text-gray-500 text-sm">权重</span>';
-            html += '<button type="button" onclick="removeWeight(\\''+k+'\\')" class="text-red-400 hover:text-red-300 ml-2">✕</button>';
+            html += '<button onclick="removeWeight(\\''+k+'\\')" class="text-red-400 hover:text-red-300 ml-auto">✕</button>';
             html += '</div>';
-        }
+        });
         container.innerHTML = html || '<p class="text-gray-500">暂无配置</p>';
     }
 
-    function updateWeight(key, val){
-        currentWeights[key] = parseInt(val) || 0;
-    }
-
-    function removeWeight(key){
-        delete currentWeights[key];
-        renderWeights(currentWeights);
-    }
+    function updateWeight(key, val){ currentWeights[key] = parseFloat(val) || 0; }
+    function removeWeight(key){ delete currentWeights[key]; renderWeights(currentWeights); }
 
     function addWeight(){
         var key = document.getElementById('newQuotaKey').value;
         var val = document.getElementById('newQuotaWeight').value;
         if(!key || !val){ toast('请输入额度和权重', false); return; }
-        currentWeights[key] = parseInt(val);
+        currentWeights[key] = parseFloat(val);
         renderWeights(currentWeights);
         document.getElementById('newQuotaKey').value = '';
         document.getElementById('newQuotaWeight').value = '';
     }
 
-    function saveCooldown(){
-        var hours = parseInt(document.getElementById('cooldownHours').value);
-        if(!hours || hours < 1){ toast('冷却时间至少1小时', false); return; }
+    function saveCooldownConfig(){
+        var minutes = parseInt(document.getElementById('cooldownMinutes').value);
+        var times = parseInt(document.getElementById('claimTimes').value);
+        if(!minutes || minutes < 1){ toast('冷却时间至少1分钟', false); return; }
+        if(!times || times < 1){ toast('领取次数至少1次', false); return; }
         
         var xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/admin/update-config', true);
         xhr.setRequestHeader('Content-Type', 'application/json');
         xhr.onreadystatechange = function(){
             if(xhr.readyState === 4){
-                try{
-                    var res = JSON.parse(xhr.responseText);
-                    toast(res.message || res.detail, xhr.status === 200);
-                }catch(e){ toast('请求失败', false); }
+                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200); }catch(e){ toast('失败', false); }
             }
         };
-        xhr.send(JSON.stringify({password: adminPwd, cooldown_hours: hours}));
+        xhr.send(JSON.stringify({password: adminPwd, cooldown_minutes: minutes, claim_times: times}));
     }
 
     function saveWeights(){
@@ -1245,10 +1540,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         xhr.setRequestHeader('Content-Type', 'application/json');
         xhr.onreadystatechange = function(){
             if(xhr.readyState === 4){
-                try{
-                    var res = JSON.parse(xhr.responseText);
-                    toast(res.message || res.detail, xhr.status === 200);
-                }catch(e){ toast('请求失败', false); }
+                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200); }catch(e){ toast('失败', false); }
             }
         };
         xhr.send(JSON.stringify({password: adminPwd, quota_weights: currentWeights}));
@@ -1264,29 +1556,37 @@ ADMIN_PAGE = '''<!DOCTYPE html>
                     if(res.success){
                         var d = res.data;
                         
-                        // 更新配置显示
-                        document.getElementById('cooldownHours').value = d.cooldown_hours || 8;
-                        renderWeights(d.quota_weights);
+                        document.getElementById('cooldownMinutes').value = d.cooldown_minutes || 480;
+                        document.getElementById('claimTimes').value = d.claim_times || 1;
+                        renderWeights(d.quota_weights || {});
                         
-                        var h = '<div class="grid grid-cols-3 gap-2 text-center mb-4">';
-                        h += '<div class="bg-gray-800 p-3 rounded"><div class="text-xl font-bold">'+d.total+'</div><div class="text-xs text-gray-500">总数</div></div>';
-                        h += '<div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-xl font-bold text-green-400">'+d.available+'</div><div class="text-xs text-gray-500">可用</div></div>';
-                        h += '<div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-xs text-gray-500">已领</div></div>';
+                        var cooldownText = d.cooldown_minutes >= 60 ? 
+                            Math.floor(d.cooldown_minutes/60) + '小时' + (d.cooldown_minutes%60 > 0 ? d.cooldown_minutes%60 + '分钟' : '') : 
+                            d.cooldown_minutes + '分钟';
+                        
+                        var h = '<div class="grid grid-cols-3 gap-4 mb-6">';
+                        h += '<div class="bg-gray-800 p-4 rounded-lg text-center"><div class="text-2xl font-bold">'+d.total+'</div><div class="text-gray-500 text-sm">总数</div></div>';
+                        h += '<div class="bg-green-900/30 p-4 rounded-lg text-center border border-green-800"><div class="text-2xl font-bold text-green-400">'+d.available+'</div><div class="text-gray-500 text-sm">可用</div></div>';
+                        h += '<div class="bg-blue-900/30 p-4 rounded-lg text-center border border-blue-800"><div class="text-2xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-gray-500 text-sm">已领</div></div>';
                         h += '</div>';
-                        h += '<div class="bg-purple-900/30 p-2 rounded border border-purple-800 mb-4 text-center"><span class="text-purple-400">冷却时间: '+d.cooldown_hours+'小时</span></div>';
-                        h += '<div class="space-y-1">';
+                        
+                        h += '<div class="grid grid-cols-2 gap-4 mb-6">';
+                        h += '<div class="bg-purple-900/30 p-3 rounded-lg border border-purple-800"><span class="text-purple-400">⏱️ 冷却时间: '+cooldownText+'</span></div>';
+                        h += '<div class="bg-orange-900/30 p-3 rounded-lg border border-orange-800"><span class="text-orange-400">🎯 每周期可领: '+d.claim_times+'次</span></div>';
+                        h += '</div>';
+                        
+                        h += '<div class="space-y-2">';
                         for(var k in d.quota_stats){
                             var v = d.quota_stats[k];
-                            h += '<div class="flex justify-between text-sm bg-gray-800/50 p-2 rounded"><span>'+k+'</span><span class="text-green-400">'+v.available+'</span><span class="text-gray-500">'+v.claimed+'</span></div>';
+                            h += '<div class="flex justify-between text-sm bg-gray-800/50 p-3 rounded"><span class="font-bold">'+k+'</span><span class="text-green-400">可用: '+v.available+'</span><span class="text-gray-500">已领: '+v.claimed+'</span></div>';
                         }
                         h += '</div>';
                         document.getElementById('statsBox').innerHTML = h;
 
                         var rh = '';
-                        for(var i=0; i<d.recent_claims.length; i++){
-                            var c = d.recent_claims[i];
-                            rh += '<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span> <span class="text-gray-600">'+c.time+'</span></div>';
-                        }
+                        d.recent_claims.forEach(function(c){
+                            rh += '<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span><br><span class="text-gray-600 text-xs">'+c.time+'</span></div>';
+                        });
                         document.getElementById('recentBox').innerHTML = rh || '<p class="text-gray-600">暂无</p>';
                     }
                 }catch(e){ console.error(e); }
@@ -1315,43 +1615,18 @@ WIDGET_PAGE = '''<!DOCTYPE html>
             color: #fff;
             max-width: 280px;
         }
-        .widget-header {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 12px;
-        }
+        .widget-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
         .widget-icon { font-size: 24px; }
         .widget-title { font-weight: 600; font-size: 14px; }
-        .widget-stats {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 12px;
-            font-size: 12px;
-            color: #94a3b8;
-        }
-        .widget-count {
-            color: #60a5fa;
-            font-weight: 700;
-            font-size: 18px;
-        }
+        .widget-stats { display: flex; justify-content: space-between; margin-bottom: 12px; font-size: 12px; color: #94a3b8; }
+        .widget-count { color: #60a5fa; font-weight: 700; font-size: 18px; }
         .widget-btn {
-            display: block;
-            width: 100%;
+            display: block; width: 100%;
             background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
-            color: #fff;
-            text-align: center;
-            padding: 10px;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: 600;
-            font-size: 14px;
-            transition: all 0.2s;
+            color: #fff; text-align: center; padding: 10px; border-radius: 8px;
+            text-decoration: none; font-weight: 600; font-size: 14px; transition: all 0.2s;
         }
-        .widget-btn:hover {
-            opacity: 0.9;
-            transform: translateY(-1px);
-        }
+        .widget-btn:hover { opacity: 0.9; transform: translateY(-1px); }
     </style>
 </head>
 <body>
@@ -1364,9 +1639,7 @@ WIDGET_PAGE = '''<!DOCTYPE html>
             <span>当前可领</span>
             <span class="widget-count">{{AVAILABLE}} 个</span>
         </div>
-        <a href="{{COUPON_SITE_URL}}/claim" target="_blank" class="widget-btn">
-            🎁 免费领取 →
-        </a>
+        <a href="{{COUPON_SITE_URL}}/claim" target="_blank" class="widget-btn">🎁 免费领取 →</a>
     </div>
 </body>
 </html>'''
@@ -1374,5 +1647,3 @@ WIDGET_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
-
