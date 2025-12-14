@@ -1083,436 +1083,274 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     <title>管理后台 - {{SITE_NAME}}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        :root {
-            --bg: #0a0a0f;
-            --card: #12121a;
-            --border: #1f1f2e;
-            --accent: #3b82f6;
-        }
-        body {
-            background: var(--bg);
-            color: #e0e0e0;
-            font-family: system-ui, -apple-system, sans-serif;
-        }
-        .card {
-            background: var(--card);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-        }
-        .input-field {
-            background: #0d0d12;
-            border: 1px solid var(--border);
-            color: #e0e0e0;
-            border-radius: 8px;
-            padding: 12px 16px;
-            width: 100%;
-        }
-        .input-field:focus {
-            border-color: var(--accent);
-            outline: none;
-        }
-        .btn {
-            padding: 12px 24px;
-            border-radius: 8px;
-            font-weight: 600;
-            border: none;
-            cursor: pointer;
-            width: 100%;
-            transition: all 0.2s;
-        }
-        .btn-primary {
-            background: var(--accent);
-            color: #fff;
-        }
-        .btn-primary:hover {
-            background: #2563eb;
-        }
-        .btn-green {
-            background: #10b981;
-            color: #fff;
-        }
-        .btn-green:hover {
-            background: #059669;
-        }
-        .toast {
-            position: fixed;
-            top: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            padding: 12px 24px;
-            border-radius: 8px;
-            color: #fff;
-            z-index: 1000;
-        }
-        #login-overlay {
-            position: fixed;
-            inset: 0;
-            background: rgba(0, 0, 0, 0.95);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 100;
-        }
-        .quota-btn {
-            transition: all 0.2s;
-        }
-        .quota-btn:hover {
-            opacity: 0.8;
-        }
-        .quota-btn.active {
-            ring: 2px;
-            ring-color: var(--accent);
-        }
+        body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui,sans-serif}
+        .card{background:#12121a;border:1px solid #1f1f2e;border-radius:12px}
+        .ipt{background:#0d0d12;border:1px solid #1f1f2e;color:#e0e0e0;border-radius:8px;padding:12px 16px;width:100%}
+        .ipt:focus{border-color:#3b82f6;outline:none}
+        .btn{padding:12px 24px;border-radius:8px;font-weight:600;border:none;cursor:pointer;width:100%}
+        .btn-blue{background:#3b82f6;color:#fff}
+        .btn-blue:hover{background:#2563eb}
+        .btn-green{background:#10b981;color:#fff}
+        .btn-green:hover{background:#059669}
+        #overlay{position:fixed;inset:0;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:100}
+        #toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;z-index:200;display:none}
     </style>
 </head>
 <body class="min-h-screen">
     <!-- 登录遮罩 -->
-    <div id="login-overlay">
+    <div id="overlay">
         <div class="card p-8 w-full max-w-sm mx-4">
             <div class="text-center mb-6">
                 <div class="text-4xl mb-2">🔐</div>
                 <h1 class="text-xl font-bold">管理后台</h1>
                 <p class="text-gray-500 text-sm">请输入管理员密码</p>
             </div>
-            <input type="password" id="login-password" class="input-field mb-4" placeholder="管理员密码">
-            <button id="btn-login" class="btn btn-primary">登录</button>
+            <input type="password" id="loginPwd" class="ipt mb-4" placeholder="管理员密码">
+            <button type="button" class="btn btn-blue" onclick="doLogin()">登录</button>
             <a href="/" class="block text-center text-gray-500 text-sm mt-4 hover:text-blue-400">← 返回首页</a>
+            <p id="loginError" class="text-red-500 text-center text-sm mt-2" style="display:none"></p>
         </div>
     </div>
 
     <!-- 管理界面 -->
-    <div id="admin-main" class="hidden">
+    <div id="adminMain" style="display:none">
         <nav class="border-b border-gray-800 py-4 px-6">
             <div class="max-w-6xl mx-auto flex justify-between items-center">
-                <h1 class="font-bold text-xl flex items-center gap-2">
-                    <span>🔧</span> 管理后台
-                </h1>
+                <h1 class="font-bold text-xl">🔧 管理后台</h1>
                 <div class="flex items-center gap-4">
-                    <a href="/" class="text-gray-400 hover:text-white text-sm">← 返回首页</a>
-                    <button id="btn-logout" class="text-red-400 hover:text-red-300 text-sm">退出登录</button>
+                    <a href="/" class="text-gray-400 hover:text-white text-sm">← 首页</a>
+                    <button type="button" class="text-red-400 text-sm" onclick="doLogout()">退出</button>
                 </div>
             </div>
         </nav>
 
         <main class="max-w-6xl mx-auto px-4 py-8">
             <div class="grid lg:grid-cols-3 gap-6">
-                <!-- 左侧：添加兑换码 -->
                 <div class="lg:col-span-2 space-y-6">
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4 flex items-center gap-2">
-                            <span>📤</span> 添加兑换码
-                        </h2>
-                        
-                        <!-- 额度选择 -->
+                        <h2 class="font-semibold mb-4">📤 添加兑换码</h2>
                         <div class="grid grid-cols-5 gap-2 mb-4">
-                            <button onclick="selectQuota(1)" class="quota-btn bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold">$1</button>
-                            <button onclick="selectQuota(5)" class="quota-btn bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold">$5</button>
-                            <button onclick="selectQuota(10)" class="quota-btn bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold">$10</button>
-                            <button onclick="selectQuota(50)" class="quota-btn bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold">$50</button>
-                            <button onclick="selectQuota(100)" class="quota-btn bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold">$100</button>
+                            <button type="button" onclick="setQuota(1)" class="bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold hover:opacity-80">$1</button>
+                            <button type="button" onclick="setQuota(5)" class="bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold hover:opacity-80">$5</button>
+                            <button type="button" onclick="setQuota(10)" class="bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold hover:opacity-80">$10</button>
+                            <button type="button" onclick="setQuota(50)" class="bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold hover:opacity-80">$50</button>
+                            <button type="button" onclick="setQuota(100)" class="bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold hover:opacity-80">$100</button>
                         </div>
-                        
                         <div class="flex items-center gap-2 mb-4">
-                            <span class="text-gray-400">当前额度:</span>
-                            <input type="number" id="quota-input" value="1" class="w-20 input-field text-center font-bold">
+                            <span class="text-gray-400">额度:</span>
+                            <input type="number" id="quotaVal" value="1" class="w-20 ipt text-center font-bold">
                             <span class="text-gray-400">美元</span>
                         </div>
-                        
-                        <!-- 文件上传 -->
                         <div class="mb-4">
-                            <label class="block text-sm text-gray-400 mb-2">上传TXT文件（每行一个兑换码）</label>
-                            <input type="file" id="file-input" accept=".txt" class="input-field">
+                            <label class="block text-sm text-gray-400 mb-2">上传TXT文件</label>
+                            <input type="file" id="txtFile" accept=".txt" class="ipt">
                         </div>
-                        <button id="btn-upload" class="btn btn-primary mb-4">上传文件</button>
-                        
+                        <button type="button" class="btn btn-blue mb-4" onclick="doUpload()">上传文件</button>
                         <hr class="border-gray-700 my-4">
-                        
-                        <!-- 手动输入 -->
                         <div>
                             <label class="block text-sm text-gray-400 mb-2">或手动粘贴（每行一个）</label>
-                            <textarea id="codes-input" rows="4" class="input-field font-mono text-sm" placeholder="粘贴兑换码，每行一个..."></textarea>
+                            <textarea id="codesText" rows="4" class="ipt font-mono text-sm" placeholder="每行一个兑换码"></textarea>
                         </div>
-                        <button id="btn-add" class="btn btn-green mt-3">添加兑换码</button>
+                        <button type="button" class="btn btn-green mt-3" onclick="doAddCodes()">添加兑换码</button>
                     </div>
 
-                    <!-- 概率说明 -->
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4 flex items-center gap-2">
-                            <span>🎰</span> 概率说明
-                        </h2>
+                        <h2 class="font-semibold mb-4">🎰 概率说明</h2>
                         <div class="grid grid-cols-5 gap-2 text-center text-sm">
-                            <div class="bg-green-900/30 p-3 rounded border border-green-800">
-                                <div class="text-green-400 font-bold">$1</div>
-                                <div class="text-gray-500">50%</div>
-                            </div>
-                            <div class="bg-blue-900/30 p-3 rounded border border-blue-800">
-                                <div class="text-blue-400 font-bold">$5</div>
-                                <div class="text-gray-500">30%</div>
-                            </div>
-                            <div class="bg-purple-900/30 p-3 rounded border border-purple-800">
-                                <div class="text-purple-400 font-bold">$10</div>
-                                <div class="text-gray-500">15%</div>
-                            </div>
-                            <div class="bg-orange-900/30 p-3 rounded border border-orange-800">
-                                <div class="text-orange-400 font-bold">$50</div>
-                                <div class="text-gray-500">4%</div>
-                            </div>
-                            <div class="bg-red-900/30 p-3 rounded border border-red-800">
-                                <div class="text-red-400 font-bold">$100</div>
-                                <div class="text-gray-500">1%</div>
-                            </div>
+                            <div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-green-400 font-bold">$1</div><div class="text-gray-500">50%</div></div>
+                            <div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-blue-400 font-bold">$5</div><div class="text-gray-500">30%</div></div>
+                            <div class="bg-purple-900/30 p-3 rounded border border-purple-800"><div class="text-purple-400 font-bold">$10</div><div class="text-gray-500">15%</div></div>
+                            <div class="bg-orange-900/30 p-3 rounded border border-orange-800"><div class="text-orange-400 font-bold">$50</div><div class="text-gray-500">4%</div></div>
+                            <div class="bg-red-900/30 p-3 rounded border border-red-800"><div class="text-red-400 font-bold">$100</div><div class="text-gray-500">1%</div></div>
                         </div>
-                        <p class="text-gray-500 text-xs mt-3 text-center">用户抽取时按此概率随机分配</p>
                     </div>
                 </div>
 
-                <!-- 右侧：统计信息 -->
                 <div class="space-y-6">
                     <div class="card p-6">
                         <div class="flex justify-between items-center mb-4">
-                            <h2 class="font-semibold flex items-center gap-2">
-                                <span>📊</span> 统计数据
-                            </h2>
-                            <button id="btn-refresh" class="text-blue-400 hover:text-blue-300 text-sm">刷新</button>
+                            <h2 class="font-semibold">📊 统计</h2>
+                            <button type="button" class="text-blue-400 text-sm" onclick="loadStats()">刷新</button>
                         </div>
-                        <div id="stats-container">加载中...</div>
+                        <div id="statsBox">加载中...</div>
                     </div>
-
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4 flex items-center gap-2">
-                            <span>📋</span> 最近领取
-                        </h2>
-                        <div id="recent-claims" class="max-h-80 overflow-y-auto space-y-2 text-sm"></div>
+                        <h2 class="font-semibold mb-4">📋 最近领取</h2>
+                        <div id="recentBox" class="max-h-80 overflow-y-auto space-y-2 text-sm"></div>
                     </div>
                 </div>
             </div>
         </main>
     </div>
 
-    <div id="toast" class="toast hidden"></div>
+    <div id="toast"></div>
 
     <script>
-        var adminPassword = '';
+    var adminPwd = '';
 
-        // 页面加载
-        window.onload = function() {
-            // 检查是否已登录
-            var savedPwd = sessionStorage.getItem('admin_password');
-            if (savedPwd) {
-                adminPassword = savedPwd;
-                checkPassword();
+    // 页面加载时检查session
+    (function(){
+        var saved = sessionStorage.getItem('admin_pwd');
+        if(saved){
+            adminPwd = saved;
+            verifyAndShow();
+        }
+        // 回车登录
+        document.getElementById('loginPwd').addEventListener('keydown', function(e){
+            if(e.key === 'Enter') doLogin();
+        });
+    })();
+
+    function toast(msg, ok){
+        var t = document.getElementById('toast');
+        t.textContent = msg;
+        t.style.display = 'block';
+        t.style.background = ok ? '#10b981' : '#ef4444';
+        setTimeout(function(){ t.style.display = 'none'; }, 3000);
+    }
+
+    function doLogin(){
+        var pwd = document.getElementById('loginPwd').value;
+        var errEl = document.getElementById('loginError');
+        
+        if(!pwd){
+            errEl.textContent = '请输入密码';
+            errEl.style.display = 'block';
+            return;
+        }
+        
+        errEl.style.display = 'none';
+        
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/login', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                if(xhr.status === 200){
+                    adminPwd = pwd;
+                    sessionStorage.setItem('admin_pwd', pwd);
+                    document.getElementById('overlay').style.display = 'none';
+                    document.getElementById('adminMain').style.display = 'block';
+                    loadStats();
+                } else {
+                    errEl.textContent = '密码错误';
+                    errEl.style.display = 'block';
+                }
             }
-
-            // 绑定事件
-            document.getElementById('btn-login').addEventListener('click', handleLogin);
-            document.getElementById('login-password').addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') handleLogin();
-            });
-            document.getElementById('btn-logout').addEventListener('click', handleLogout);
-            document.getElementById('btn-upload').addEventListener('click', handleUpload);
-            document.getElementById('btn-add').addEventListener('click', handleAdd);
-            document.getElementById('btn-refresh').addEventListener('click', loadStats);
         };
+        xhr.onerror = function(){
+            errEl.textContent = '网络错误';
+            errEl.style.display = 'block';
+        };
+        xhr.send(JSON.stringify({password: pwd}));
+    }
 
-        // 显示提示
-        function showToast(message, isSuccess) {
-            var toast = document.getElementById('toast');
-            toast.textContent = message;
-            toast.className = 'toast ' + (isSuccess ? 'bg-green-600' : 'bg-red-600');
-            setTimeout(function() {
-                toast.classList.add('hidden');
-            }, 3000);
-        }
-
-        // 登录
-        function handleLogin() {
-            var password = document.getElementById('login-password').value;
-            if (!password) {
-                showToast('请输入密码', false);
-                return;
-            }
-
-            fetch('/api/admin/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ password: password })
-            })
-            .then(function(response) {
-                if (response.ok) {
-                    adminPassword = password;
-                    sessionStorage.setItem('admin_password', password);
-                    showAdminUI();
+    function verifyAndShow(){
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/api/admin/stats?password=' + encodeURIComponent(adminPwd), true);
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                if(xhr.status === 200){
+                    document.getElementById('overlay').style.display = 'none';
+                    document.getElementById('adminMain').style.display = 'block';
                     loadStats();
                 } else {
-                    showToast('密码错误', false);
+                    sessionStorage.removeItem('admin_pwd');
+                    adminPwd = '';
                 }
-            })
-            .catch(function(error) {
-                console.error('登录失败', error);
-                showToast('网络错误', false);
-            });
-        }
-
-        // 检查密码
-        function checkPassword() {
-            fetch('/api/admin/stats?password=' + encodeURIComponent(adminPassword))
-            .then(function(response) {
-                if (response.ok) {
-                    showAdminUI();
-                    loadStats();
-                } else {
-                    sessionStorage.removeItem('admin_password');
-                    adminPassword = '';
-                }
-            })
-            .catch(function(error) {
-                console.error('验证失败', error);
-            });
-        }
-
-        // 显示管理界面
-        function showAdminUI() {
-            document.getElementById('login-overlay').classList.add('hidden');
-            document.getElementById('admin-main').classList.remove('hidden');
-        }
-
-        // 退出登录
-        function handleLogout() {
-            sessionStorage.removeItem('admin_password');
-            adminPassword = '';
-            location.reload();
-        }
-
-        // 选择额度
-        function selectQuota(quota) {
-            document.getElementById('quota-input').value = quota;
-            // 更新按钮样式
-            document.querySelectorAll('.quota-btn').forEach(function(btn) {
-                btn.classList.remove('ring-2', 'ring-blue-500');
-            });
-            event.target.classList.add('ring-2', 'ring-blue-500');
-        }
-
-        // 上传文件
-        function handleUpload() {
-            var quota = document.getElementById('quota-input').value;
-            var fileInput = document.getElementById('file-input');
-            var file = fileInput.files[0];
-
-            if (!file) {
-                showToast('请选择文件', false);
-                return;
             }
+        };
+        xhr.send();
+    }
 
-            var formData = new FormData();
-            formData.append('password', adminPassword);
-            formData.append('quota', quota);
-            formData.append('file', file);
+    function doLogout(){
+        sessionStorage.removeItem('admin_pwd');
+        adminPwd = '';
+        location.reload();
+    }
 
-            fetch('/api/admin/upload-txt', {
-                method: 'POST',
-                body: formData
-            })
-            .then(function(response) {
-                return response.json();
-            })
-            .then(function(data) {
-                showToast(data.message || data.detail, !!data.success);
-                if (data.success) {
-                    loadStats();
-                    fileInput.value = '';
-                }
-            })
-            .catch(function(error) {
-                console.error('上传失败', error);
-                showToast('上传失败', false);
-            });
-        }
+    function setQuota(q){
+        document.getElementById('quotaVal').value = q;
+    }
 
-        // 手动添加
-        function handleAdd() {
-            var quota = parseFloat(document.getElementById('quota-input').value);
-            var text = document.getElementById('codes-input').value;
-            var codes = text.split('\n').filter(function(s) { return s.trim(); });
+    function doUpload(){
+        var q = document.getElementById('quotaVal').value;
+        var f = document.getElementById('txtFile').files[0];
+        if(!f){ toast('请选择文件', false); return; }
 
-            if (codes.length === 0) {
-                showToast('请输入兑换码', false);
-                return;
+        var fd = new FormData();
+        fd.append('password', adminPwd);
+        fd.append('quota', q);
+        fd.append('file', f);
+
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/upload-txt', true);
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                try{
+                    var res = JSON.parse(xhr.responseText);
+                    toast(res.message || res.detail, xhr.status === 200);
+                    if(xhr.status === 200){ loadStats(); document.getElementById('txtFile').value = ''; }
+                }catch(e){ toast('请求失败', false); }
             }
+        };
+        xhr.send(fd);
+    }
 
-            fetch('/api/admin/add-coupons', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    password: adminPassword,
-                    quota: quota,
-                    coupons: codes
-                })
-            })
-            .then(function(response) {
-                return response.json();
-            })
-            .then(function(data) {
-                showToast(data.message || data.detail, !!data.success);
-                if (data.success) {
-                    loadStats();
-                    document.getElementById('codes-input').value = '';
-                }
-            })
-            .catch(function(error) {
-                console.error('添加失败', error);
-                showToast('添加失败', false);
-            });
-        }
+    function doAddCodes(){
+        var q = parseFloat(document.getElementById('quotaVal').value);
+        var txt = document.getElementById('codesText').value;
+        var arr = txt.split('\\n').filter(function(s){ return s.trim(); });
+        if(!arr.length){ toast('请输入兑换码', false); return; }
 
-        // 加载统计
-        function loadStats() {
-            fetch('/api/admin/stats?password=' + encodeURIComponent(adminPassword))
-            .then(function(response) {
-                return response.json();
-            })
-            .then(function(result) {
-                if (result.success) {
-                    var data = result.data;
-                    
-                    // 统计数据
-                    var statsHtml = '<div class="grid grid-cols-3 gap-2 text-center mb-4">';
-                    statsHtml += '<div class="bg-gray-800 p-3 rounded"><div class="text-xl font-bold">' + data.total + '</div><div class="text-xs text-gray-500">总数</div></div>';
-                    statsHtml += '<div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-xl font-bold text-green-400">' + data.available + '</div><div class="text-xs text-gray-500">可用</div></div>';
-                    statsHtml += '<div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-xl font-bold text-blue-400">' + data.claimed + '</div><div class="text-xs text-gray-500">已领</div></div>';
-                    statsHtml += '</div>';
-                    
-                    statsHtml += '<div class="space-y-1">';
-                    for (var key in data.quota_stats) {
-                        var stat = data.quota_stats[key];
-                        statsHtml += '<div class="flex justify-between text-sm bg-gray-800/50 p-2 rounded">';
-                        statsHtml += '<span>' + key + '</span>';
-                        statsHtml += '<span class="text-green-400">' + stat.available + ' 可用</span>';
-                        statsHtml += '<span class="text-gray-500">' + stat.claimed + ' 已领</span>';
-                        statsHtml += '</div>';
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/add-coupons', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                try{
+                    var res = JSON.parse(xhr.responseText);
+                    toast(res.message || res.detail, xhr.status === 200);
+                    if(xhr.status === 200){ loadStats(); document.getElementById('codesText').value = ''; }
+                }catch(e){ toast('请求失败', false); }
+            }
+        };
+        xhr.send(JSON.stringify({password: adminPwd, quota: q, coupons: arr}));
+    }
+
+    function loadStats(){
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/api/admin/stats?password=' + encodeURIComponent(adminPwd), true);
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4 && xhr.status === 200){
+                try{
+                    var res = JSON.parse(xhr.responseText);
+                    if(res.success){
+                        var d = res.data;
+                        var h = '<div class="grid grid-cols-3 gap-2 text-center mb-4">';
+                        h += '<div class="bg-gray-800 p-3 rounded"><div class="text-xl font-bold">'+d.total+'</div><div class="text-xs text-gray-500">总数</div></div>';
+                        h += '<div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-xl font-bold text-green-400">'+d.available+'</div><div class="text-xs text-gray-500">可用</div></div>';
+                        h += '<div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-xs text-gray-500">已领</div></div>';
+                        h += '</div><div class="space-y-1">';
+                        for(var k in d.quota_stats){
+                            var v = d.quota_stats[k];
+                            h += '<div class="flex justify-between text-sm bg-gray-800/50 p-2 rounded"><span>'+k+'</span><span class="text-green-400">'+v.available+'</span><span class="text-gray-500">'+v.claimed+'</span></div>';
+                        }
+                        h += '</div>';
+                        document.getElementById('statsBox').innerHTML = h;
+
+                        var rh = '';
+                        for(var i=0; i<d.recent_claims.length; i++){
+                            var c = d.recent_claims[i];
+                            rh += '<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span> <span class="text-gray-600">'+c.time+'</span></div>';
+                        }
+                        document.getElementById('recentBox').innerHTML = rh || '<p class="text-gray-600">暂无</p>';
                     }
-                    statsHtml += '</div>';
-                    
-                    document.getElementById('stats-container').innerHTML = statsHtml;
-
-                    // 最近领取
-                    var recentHtml = '';
-                    for (var i = 0; i < data.recent_claims.length; i++) {
-                        var claim = data.recent_claims[i];
-                        recentHtml += '<div class="bg-gray-800/50 p-2 rounded text-gray-400">';
-                        recentHtml += '<span class="text-blue-400">ID:' + claim.user_id + '</span> ';
-                        recentHtml += claim.username + ' ';
-                        recentHtml += '<span class="text-green-400">$' + claim.quota + '</span> ';
-                        recentHtml += '<span class="text-gray-600">' + claim.time + '</span>';
-                        recentHtml += '</div>';
-                    }
-                    document.getElementById('recent-claims').innerHTML = recentHtml || '<p class="text-gray-600 text-center">暂无记录</p>';
-                }
-            })
-            .catch(function(error) {
-                console.error('加载统计失败', error);
-            });
-        }
+                }catch(e){ console.error(e); }
+            }
+        };
+        xhr.send();
+    }
     </script>
 </body>
 </html>'''
