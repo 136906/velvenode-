@@ -9,21 +9,17 @@ import httpx
 import random
 import os
 import json
-import hashlib
 
 # ============ 配置 ============
 NEW_API_URL = os.getenv("NEW_API_URL", "https://velvenode.zeabur.app")
 COUPON_SITE_URL = os.getenv("COUPON_SITE_URL", "https://velvenodehome.zeabur.app")
 
-# 管理员系统访问令牌（在 New API 个人设置 → 安全设置 → 系统访问令牌 生成）
 ADMIN_ACCESS_TOKEN = os.getenv("ADMIN_ACCESS_TOKEN", "")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "1")
 
-# 时区配置
 TIMEZONE_OFFSET_HOURS = int(os.getenv("TIMEZONE_OFFSET_HOURS", "8"))
 APP_TIMEZONE = timezone(timedelta(hours=TIMEZONE_OFFSET_HOURS))
 
-# 持久化数据目录
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -32,13 +28,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR}/coupon.db")
 SITE_NAME = os.getenv("SITE_NAME", "velvenode")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
-# 默认配置
 DEFAULT_COOLDOWN_MINUTES = 480
 DEFAULT_CLAIM_TIMES = 1
 DEFAULT_QUOTA_WEIGHTS = {"1": 50, "5": 30, "10": 15, "50": 4, "100": 1}
-DEFAULT_DISPLAY_COUNT = 100  # 默认显示可领取数量
-DEFAULT_CLAIM_MODE = "A"  # A=返回兑换码, B=直接充值
-DEFAULT_QUOTA_RATE = 500000  # $1 = 500000 quota
+DEFAULT_DISPLAY_COUNT = 100
+DEFAULT_CLAIM_MODE = "A"
+DEFAULT_QUOTA_RATE = 500000
 
 # ============ 数据库 ============
 Base = declarative_base()
@@ -53,7 +48,7 @@ class CouponPool(Base):
     claimed_by_username = Column(String(255), nullable=True)
     claimed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    source = Column(String(32), default="manual")  # manual=手动添加, api=API创建
+    source = Column(String(32), default="manual")
 
 class ClaimRecord(Base):
     __tablename__ = "claim_records"
@@ -64,7 +59,7 @@ class ClaimRecord(Base):
     quota_dollars = Column(Float, default=1.0)
     claim_time = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     cooldown_expires_at = Column(DateTime, nullable=True)
-    auto_redeemed = Column(Boolean, default=False)  # 是否自动充值
+    auto_redeemed = Column(Boolean, default=False)
 
 class SystemConfig(Base):
     __tablename__ = "system_config"
@@ -77,7 +72,6 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} i
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
 
-# 自动迁移
 def auto_migrate():
     with engine.connect() as conn:
         try:
@@ -89,7 +83,6 @@ def auto_migrate():
             if 'auto_redeemed' not in columns:
                 conn.execute(text("ALTER TABLE claim_records ADD COLUMN auto_redeemed BOOLEAN DEFAULT 0"))
                 conn.commit()
-            
             result2 = conn.execute(text("PRAGMA table_info(coupon_pool)"))
             columns2 = [row[1] for row in result2]
             if 'source' not in columns2:
@@ -107,7 +100,6 @@ def get_db():
     finally:
         db.close()
 
-# ============ 时间工具 ============
 def now_utc():
     return datetime.now(timezone.utc)
 
@@ -125,7 +117,6 @@ def format_local_time(dt):
     dt_local = dt_utc.astimezone(APP_TIMEZONE)
     return dt_local.strftime("%Y-%m-%d %H:%M:%S")
 
-# ============ 配置管理 ============
 def get_config(db: Session, key: str, default=None):
     config = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
     return config.config_value if config else default
@@ -185,16 +176,22 @@ app = FastAPI(title="兑换券系统")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ============ 用户验证 ============
-async def verify_user_by_access_token(access_token: str) -> dict | None:
-    """用 Access Token 验证并获取用户信息"""
+async def verify_user_by_access_token(user_id: int, access_token: str) -> dict | None:
+    """用 用户ID + Access Token 验证并获取用户信息"""
     if not access_token or len(access_token) < 10:
+        return None
+    if not user_id or user_id < 1:
         return None
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{NEW_API_URL}/api/user/self",
-                headers={"Authorization": f"Bearer {access_token}"}
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "New-Api-User": str(user_id),
+                    "Content-Type": "application/json"
+                }
             )
             if response.status_code != 200:
                 return None
@@ -202,12 +199,15 @@ async def verify_user_by_access_token(access_token: str) -> dict | None:
             if not data.get("success"):
                 return None
             user_data = data.get("data", {})
-            user_id = user_data.get("id")
+            returned_id = user_data.get("id")
             username = user_data.get("username")
-            if not user_id or not username:
+            # 验证返回的用户ID与提交的一致
+            if returned_id != user_id:
+                return None
+            if not username:
                 return None
             return {
-                "user_id": user_id,
+                "user_id": returned_id,
                 "username": username,
                 "display_name": user_data.get("display_name", username)
             }
@@ -219,10 +219,8 @@ async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> s
     """调用 New API 创建兑换码"""
     if not ADMIN_ACCESS_TOKEN:
         return None
-    
     quota_rate = get_quota_rate(db)
     quota = int(quota_dollars * quota_rate)
-    
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
@@ -251,7 +249,7 @@ async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> s
         print(f"创建兑换码异常: {e}")
         return None
 
-async def topup_user(user_access_token: str, redemption_code: str) -> bool:
+async def topup_user(user_id: int, user_access_token: str, redemption_code: str) -> bool:
     """帮用户充值"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -259,6 +257,7 @@ async def topup_user(user_access_token: str, redemption_code: str) -> bool:
                 f"{NEW_API_URL}/api/user/topup",
                 headers={
                     "Authorization": f"Bearer {user_access_token}",
+                    "New-Api-User": str(user_id),
                     "Content-Type": "application/json"
                 },
                 json={"key": redemption_code}
@@ -270,7 +269,6 @@ async def topup_user(user_access_token: str, redemption_code: str) -> bool:
         return False
 
 def get_random_quota(db: Session) -> float:
-    """根据权重随机选择一个额度"""
     weights = get_quota_weights(db)
     if not weights:
         return 1.0
@@ -282,7 +280,6 @@ def get_random_quota(db: Session) -> float:
     return random.choices(quotas, weights=weight_values, k=1)[0]
 
 def get_local_coupon(db: Session, quota: float):
-    """获取本地对应额度的可用兑换码"""
     return db.query(CouponPool).filter(
         CouponPool.is_claimed == False,
         CouponPool.quota_dollars == quota
@@ -299,12 +296,10 @@ def calculate_user_cooldown_status(db: Session, user_id: int, now: datetime):
     cooldown_minutes = get_cooldown_minutes(db)
     claim_times = get_claim_times(db)
     max_lookback = now - timedelta(minutes=cooldown_minutes * 2)
-    
     recent_claims = db.query(ClaimRecord).filter(
         ClaimRecord.user_id == user_id,
         ClaimRecord.claim_time >= max_lookback
     ).order_by(ClaimRecord.claim_time.desc()).all()
-    
     active_claims = []
     for claim in recent_claims:
         claim_time = ensure_utc(claim.claim_time)
@@ -313,51 +308,60 @@ def calculate_user_cooldown_status(db: Session, user_id: int, now: datetime):
         actual_expires = min(config_expires, stored_expires) if stored_expires else config_expires
         if now < actual_expires:
             active_claims.append({'claim': claim, 'expires_at': actual_expires})
-    
     claims_in_period = len(active_claims)
     remaining_claims = max(0, claim_times - claims_in_period)
     can_claim = True
     cooldown_seconds = 0
-    
     if claims_in_period >= claim_times and active_claims:
         earliest_expiry = min(c['expires_at'] for c in active_claims)
         if now < earliest_expiry:
             can_claim = False
             cooldown_seconds = int((earliest_expiry - now).total_seconds())
-    
     return can_claim, remaining_claims, cooldown_seconds, recent_claims
 
 # ============ 用户 API ============
 @app.post("/api/verify")
 async def verify_user(request: Request):
     body = await request.json()
+    user_id = body.get("user_id")
     access_token = body.get("access_token", "").strip()
     
+    if not user_id:
+        raise HTTPException(status_code=400, detail="请填写用户ID")
     if not access_token:
         raise HTTPException(status_code=400, detail="请填写系统访问令牌")
     
-    user_info = await verify_user_by_access_token(access_token)
+    try:
+        user_id = int(user_id)
+    except:
+        raise HTTPException(status_code=400, detail="用户ID必须是数字")
+    
+    user_info = await verify_user_by_access_token(user_id, access_token)
     if not user_info:
-        raise HTTPException(status_code=401, detail="令牌无效或已过期，请重新生成")
+        raise HTTPException(status_code=401, detail="验证失败，请检查用户ID和令牌是否正确")
     
     return {"success": True, "data": user_info}
 
 @app.post("/api/claim/status")
 async def get_claim_status(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
+    user_id = body.get("user_id")
     access_token = body.get("access_token", "").strip()
     
-    if not access_token:
-        raise HTTPException(status_code=400, detail="请填写系统访问令牌")
+    if not user_id or not access_token:
+        raise HTTPException(status_code=400, detail="请填写完整信息")
     
-    user_info = await verify_user_by_access_token(access_token)
+    try:
+        user_id = int(user_id)
+    except:
+        raise HTTPException(status_code=400, detail="用户ID必须是数字")
+    
+    user_info = await verify_user_by_access_token(user_id, access_token)
     if not user_info:
         raise HTTPException(status_code=401, detail="令牌无效")
     
-    user_id = user_info["user_id"]
     claim_times = get_claim_times(db)
     now = now_utc()
-    
     can_claim, remaining_claims, cooldown_seconds, _ = calculate_user_cooldown_status(db, user_id, now)
     
     cooldown_text = None
@@ -389,7 +393,7 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
                     "coupon_code": r.coupon_code,
                     "quota": r.quota_dollars,
                     "claim_time": r.claim_time.isoformat() if r.claim_time else "",
-                    "auto_redeemed": r.auto_redeemed if hasattr(r, 'auto_redeemed') else False
+                    "auto_redeemed": getattr(r, 'auto_redeemed', False)
                 } for r in history
             ]
         }
@@ -398,18 +402,22 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
 @app.post("/api/claim")
 async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
+    user_id = body.get("user_id")
     access_token = body.get("access_token", "").strip()
     
-    if not access_token:
-        raise HTTPException(status_code=400, detail="请填写系统访问令牌")
+    if not user_id or not access_token:
+        raise HTTPException(status_code=400, detail="请填写完整信息")
     
-    user_info = await verify_user_by_access_token(access_token)
+    try:
+        user_id = int(user_id)
+    except:
+        raise HTTPException(status_code=400, detail="用户ID必须是数字")
+    
+    user_info = await verify_user_by_access_token(user_id, access_token)
     if not user_info:
         raise HTTPException(status_code=401, detail="令牌无效")
     
-    user_id = user_info["user_id"]
     username = user_info["username"]
-    
     cooldown_minutes = get_cooldown_minutes(db)
     claim_times = get_claim_times(db)
     now = now_utc()
@@ -427,15 +435,12 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     if display_count <= 0:
         raise HTTPException(status_code=400, detail="兑换码已领完")
     
-    # 抽奖决定额度
     quota = get_random_quota(db)
     claim_mode = get_claim_mode(db)
     coupon_code = None
     auto_redeemed = False
-    source = "manual"
     
     if claim_mode == "A":
-        # 模式A：优先本地，没有则调API
         local_coupon = get_local_coupon(db, quota)
         if local_coupon:
             coupon_code = local_coupon.coupon_code
@@ -443,12 +448,9 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
             local_coupon.claimed_by_user_id = user_id
             local_coupon.claimed_by_username = username
             local_coupon.claimed_at = now
-            source = "manual"
         else:
             coupon_code = await create_redemption_code_via_api(quota, db)
-            source = "api"
             if coupon_code:
-                # 存入本地数据库
                 new_coupon = CouponPool(
                     coupon_code=coupon_code,
                     quota_dollars=quota,
@@ -460,11 +462,8 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
                 )
                 db.add(new_coupon)
     else:
-        # 模式B：直接调API创建并充值
         coupon_code = await create_redemption_code_via_api(quota, db)
-        source = "api"
         if coupon_code:
-            # 存入本地数据库
             new_coupon = CouponPool(
                 coupon_code=coupon_code,
                 quota_dollars=quota,
@@ -475,14 +474,12 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
                 source="api"
             )
             db.add(new_coupon)
-            # 帮用户充值
-            if await topup_user(access_token, coupon_code):
+            if await topup_user(user_id, access_token, coupon_code):
                 auto_redeemed = True
     
     if not coupon_code:
         raise HTTPException(status_code=500, detail="兑换码生成失败，请稍后重试")
     
-    # 记录领取
     cooldown_expires = now + timedelta(minutes=cooldown_minutes)
     record = ClaimRecord(
         user_id=user_id,
@@ -495,7 +492,6 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     )
     db.add(record)
     
-    # 更新显示数量
     new_display = max(0, display_count - 1)
     set_config(db, "display_count", str(new_display))
     
@@ -524,10 +520,8 @@ async def add_coupons(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
     if body.get("password") != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
-    
     coupons = body.get("coupons", [])
     quota = float(body.get("quota", 1))
-    
     added = 0
     for code in coupons:
         code = code.strip()
@@ -535,7 +529,6 @@ async def add_coupons(request: Request, db: Session = Depends(get_db)):
             db.add(CouponPool(coupon_code=code, quota_dollars=quota, source="manual"))
             added += 1
     db.commit()
-    
     total = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     return {"success": True, "message": f"成功添加 {added} 个兑换码，本地可用: {total} 个"}
 
@@ -543,10 +536,8 @@ async def add_coupons(request: Request, db: Session = Depends(get_db)):
 async def upload_txt(password: str = Form(...), quota: float = Form(1), file: UploadFile = File(...), db: Session = Depends(get_db)):
     if password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
-    
     content = await file.read()
     lines = content.decode("utf-8").strip().split("\n")
-    
     added = 0
     for line in lines:
         code = line.strip()
@@ -554,7 +545,6 @@ async def upload_txt(password: str = Form(...), quota: float = Form(1), file: Up
             db.add(CouponPool(coupon_code=code, quota_dollars=quota, source="manual"))
             added += 1
     db.commit()
-    
     total = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     return {"success": True, "message": f"成功添加 {added} 个兑换码，本地可用: {total} 个"}
 
@@ -562,7 +552,6 @@ async def upload_txt(password: str = Form(...), quota: float = Form(1), file: Up
 async def get_coupons(password: str, page: int = 1, per_page: int = 20, status: str = "all", search: str = "", db: Session = Depends(get_db)):
     if password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
-    
     query = db.query(CouponPool)
     if status == "available":
         query = query.filter(CouponPool.is_claimed == False)
@@ -570,10 +559,8 @@ async def get_coupons(password: str, page: int = 1, per_page: int = 20, status: 
         query = query.filter(CouponPool.is_claimed == True)
     if search:
         query = query.filter(CouponPool.coupon_code.contains(search))
-    
     total = query.count()
     coupons = query.order_by(CouponPool.id.desc()).offset((page - 1) * per_page).limit(per_page).all()
-    
     return {
         "success": True,
         "data": {
@@ -601,11 +588,9 @@ async def delete_coupon(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
     if body.get("password") != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
-    
     coupon = db.query(CouponPool).filter(CouponPool.id == body.get("id")).first()
     if not coupon:
         raise HTTPException(status_code=404, detail="兑换码不存在")
-    
     db.delete(coupon)
     db.commit()
     return {"success": True, "message": "删除成功"}
@@ -615,10 +600,8 @@ async def delete_coupons_batch(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
     if body.get("password") != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
-    
     delete_type = body.get("type", "selected")
     ids = body.get("ids", [])
-    
     if delete_type == "selected":
         deleted = db.query(CouponPool).filter(CouponPool.id.in_(ids)).delete(synchronize_session=False)
     elif delete_type == "all_available":
@@ -629,7 +612,6 @@ async def delete_coupons_batch(request: Request, db: Session = Depends(get_db)):
         deleted = db.query(CouponPool).delete(synchronize_session=False)
     else:
         deleted = 0
-    
     db.commit()
     return {"success": True, "message": f"成功删除 {deleted} 个兑换码"}
 
@@ -637,24 +619,19 @@ async def delete_coupons_batch(request: Request, db: Session = Depends(get_db)):
 async def get_stats(password: str, db: Session = Depends(get_db)):
     if password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
-    
     total = db.query(CouponPool).count()
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     claimed = db.query(CouponPool).filter(CouponPool.is_claimed == True).count()
-    
     from sqlalchemy import distinct
     all_quotas = db.query(distinct(CouponPool.quota_dollars)).all()
     all_quotas = sorted([q[0] for q in all_quotas])
-    
     quota_stats = {}
     for q in all_quotas:
         avail = db.query(CouponPool).filter(CouponPool.is_claimed == False, CouponPool.quota_dollars == q).count()
         used = db.query(CouponPool).filter(CouponPool.is_claimed == True, CouponPool.quota_dollars == q).count()
         if avail > 0 or used > 0:
             quota_stats[f"${q}"] = {"available": avail, "claimed": used}
-    
     recent = db.query(ClaimRecord).order_by(ClaimRecord.claim_time.desc()).limit(50).all()
-    
     return {
         "success": True,
         "data": {
@@ -688,81 +665,51 @@ async def update_config(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
     if body.get("password") != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
-    
     if "cooldown_minutes" in body:
-        minutes = int(body["cooldown_minutes"])
-        if minutes < 1:
-            raise HTTPException(status_code=400, detail="冷却时间至少为1分钟")
-        set_config(db, "cooldown_minutes", str(minutes))
-    
+        set_config(db, "cooldown_minutes", str(int(body["cooldown_minutes"])))
     if "claim_times" in body:
-        times = int(body["claim_times"])
-        if times < 1:
-            raise HTTPException(status_code=400, detail="领取次数至少为1次")
-        set_config(db, "claim_times", str(times))
-    
+        set_config(db, "claim_times", str(int(body["claim_times"])))
     if "quota_weights" in body:
-        weights = body["quota_weights"]
-        if isinstance(weights, dict):
-            set_config(db, "quota_weights", json.dumps(weights))
-    
+        if isinstance(body["quota_weights"], dict):
+            set_config(db, "quota_weights", json.dumps(body["quota_weights"]))
     if "display_count" in body:
-        count = int(body["display_count"])
-        if count < 0:
-            raise HTTPException(status_code=400, detail="显示数量不能为负数")
-        set_config(db, "display_count", str(count))
-    
+        set_config(db, "display_count", str(int(body["display_count"])))
     if "claim_mode" in body:
-        mode = body["claim_mode"]
-        if mode in ["A", "B"]:
-            set_config(db, "claim_mode", mode)
-    
+        if body["claim_mode"] in ["A", "B"]:
+            set_config(db, "claim_mode", body["claim_mode"])
     if "quota_rate" in body:
-        rate = int(body["quota_rate"])
-        if rate < 1:
-            raise HTTPException(status_code=400, detail="额度比例至少为1")
-        set_config(db, "quota_rate", str(rate))
-    
+        set_config(db, "quota_rate", str(int(body["quota_rate"])))
     return {"success": True, "message": "配置已更新"}
 
 @app.get("/api/stats/public")
 async def get_public_stats(db: Session = Depends(get_db)):
-    display_count = get_display_count(db)
-    cooldown_minutes = get_cooldown_minutes(db)
-    claim_times = get_claim_times(db)
     return {
-        "available": display_count,
-        "cooldown_minutes": cooldown_minutes,
-        "cooldown_text": format_cooldown(cooldown_minutes),
-        "claim_times": claim_times
+        "available": get_display_count(db),
+        "cooldown_minutes": get_cooldown_minutes(db),
+        "cooldown_text": format_cooldown(get_cooldown_minutes(db)),
+        "claim_times": get_claim_times(db)
     }
 
 # ============ 页面路由 ============
 @app.get("/", response_class=HTMLResponse)
 async def index(db: Session = Depends(get_db)):
-    display_count = get_display_count(db)
-    cooldown_minutes = get_cooldown_minutes(db)
-    claim_times = get_claim_times(db)
     html = HOME_PAGE
-    html = html.replace("{{AVAILABLE}}", str(display_count))
+    html = html.replace("{{AVAILABLE}}", str(get_display_count(db)))
     html = html.replace("{{SITE_NAME}}", SITE_NAME)
     html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
-    html = html.replace("{{COOLDOWN_TEXT}}", format_cooldown(cooldown_minutes))
-    html = html.replace("{{CLAIM_TIMES}}", str(claim_times))
+    html = html.replace("{{COOLDOWN_TEXT}}", format_cooldown(get_cooldown_minutes(db)))
+    html = html.replace("{{CLAIM_TIMES}}", str(get_claim_times(db)))
     html = html.replace("{{COUPON_SITE_URL}}", COUPON_SITE_URL)
     return html
 
 @app.get("/claim", response_class=HTMLResponse)
 async def claim_page(db: Session = Depends(get_db)):
-    display_count = get_display_count(db)
-    cooldown_minutes = get_cooldown_minutes(db)
-    claim_times = get_claim_times(db)
     html = CLAIM_PAGE
-    html = html.replace("{{AVAILABLE}}", str(display_count))
+    html = html.replace("{{AVAILABLE}}", str(get_display_count(db)))
     html = html.replace("{{SITE_NAME}}", SITE_NAME)
     html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
-    html = html.replace("{{COOLDOWN_TEXT}}", format_cooldown(cooldown_minutes))
-    html = html.replace("{{CLAIM_TIMES}}", str(claim_times))
+    html = html.replace("{{COOLDOWN_TEXT}}", format_cooldown(get_cooldown_minutes(db)))
+    html = html.replace("{{CLAIM_TIMES}}", str(get_claim_times(db)))
     return html
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -779,48 +726,150 @@ HOME_PAGE = '''<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root{--bg:#0a0a0f;--card:#12121a;--border:#1f1f2e;--accent:#3b82f6}
-        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif}
+        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif;padding-top:20px}
         .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
         .btn{padding:10px 20px;border-radius:8px;font-weight:500;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border:none}
         .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
         .btn-secondary{background:#1f1f2e;color:#e0e0e0;border:1px solid #2a2a3a}.btn-secondary:hover{background:#2a2a3a}
+        .btn-console{background:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#fff}.btn-console:hover{opacity:0.9}
+        .code-box{background:#0d0d12;border:1px solid var(--border);border-radius:8px;padding:14px 18px;font-family:ui-monospace,monospace}
         .glow{box-shadow:0 0 40px rgba(59,130,246,0.15)}
+        .endpoint-container{height:24px;overflow:hidden;display:inline-block}
+        .endpoint-slider{animation:slideEndpoints 12s infinite}
+        .endpoint-item{height:24px;line-height:24px}
+        @keyframes slideEndpoints{0%,16%{transform:translateY(0)}20%,36%{transform:translateY(-24px)}40%,56%{transform:translateY(-48px)}60%,76%{transform:translateY(-72px)}80%,96%{transform:translateY(-96px)}100%{transform:translateY(0)}}
     </style>
 </head>
-<body class="min-h-screen py-8">
+<body class="min-h-screen">
     <section class="py-16 px-6">
         <div class="max-w-3xl mx-auto text-center">
             <h1 class="text-4xl md:text-5xl font-bold mb-4 bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">统一的大模型API网关</h1>
             <p class="text-lg text-gray-400 mb-10">更低的价格，更稳定的服务，只需替换API地址即可使用</p>
+            
+            <div class="code-box max-w-2xl mx-auto mb-8">
+                <div class="flex items-center justify-between flex-wrap gap-4">
+                    <div class="flex items-center gap-2 text-sm">
+                        <span class="text-gray-500">API地址:</span>
+                        <span class="text-blue-400">{{NEW_API_URL}}</span>
+                        <div class="endpoint-container">
+                            <div class="endpoint-slider">
+                                <div class="endpoint-item text-cyan-400">/v1/chat/completions</div>
+                                <div class="endpoint-item text-cyan-400">/v1/models</div>
+                                <div class="endpoint-item text-cyan-400">/v1/embeddings</div>
+                                <div class="endpoint-item text-cyan-400">/v1/images/generations</div>
+                                <div class="endpoint-item text-cyan-400">/v1/audio/transcriptions</div>
+                            </div>
+                        </div>
+                    </div>
+                    <button onclick="copyAPI()" id="copy-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded transition">复制</button>
+                </div>
+            </div>
+            
             <div class="flex justify-center gap-4 flex-wrap">
                 <a href="{{NEW_API_URL}}/console/token" target="_blank" class="btn btn-primary text-base">🔑 获取API Key</a>
-                <a href="{{NEW_API_URL}}/console" target="_blank" class="btn btn-primary text-base">🖥️ 控制台</a>
-                <a href="/claim" class="btn btn-secondary text-base">🎫 领取兑换券</a>
+                <a href="{{NEW_API_URL}}/console" target="_blank" class="btn btn-console text-base">🖥️ 控制台</a>
+                <a href="/claim" target="_top" class="btn btn-secondary text-base">🎫 领取兑换券</a>
+            </div>
+        </div>
+    </section>
+
+    <section id="api" class="py-16 px-6 border-t border-gray-800">
+        <div class="max-w-4xl mx-auto">
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>📖</span> API接入教程</h2>
+            <div class="grid md:grid-cols-2 gap-6">
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-blue-400">1️⃣ 获取API Key</h3>
+                    <ol class="space-y-2 text-gray-400 text-sm">
+                        <li>1. 访问 <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">{{SITE_NAME}}控制台</a></li>
+                        <li>2. 注册/登录账号</li>
+                        <li>3. 进入「<a href="{{NEW_API_URL}}/console/token" target="_blank" class="text-blue-400 hover:underline">令牌管理</a>」创建API Key</li>
+                        <li>4. 复制生成的 sk-xxx 密钥</li>
+                    </ol>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-green-400">2️⃣ 配置API地址</h3>
+                    <div class="code-box text-sm mb-3">
+                        <div class="text-gray-500"># API Base URL</div>
+                        <div class="text-green-400">{{NEW_API_URL}}</div>
+                    </div>
+                    <p class="text-gray-400 text-sm">将此地址替换到你的应用中即可</p>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-purple-400">3️⃣ ChatGPT-Next-Web</h3>
+                    <ol class="space-y-2 text-gray-400 text-sm">
+                        <li>1. 设置 → 自定义接口</li>
+                        <li>2. 接口地址: <code class="text-purple-400 bg-purple-900/30 px-1 rounded">{{NEW_API_URL}}</code></li>
+                        <li>3. API Key: 填入你的密钥</li>
+                        <li>4. 保存即可使用</li>
+                    </ol>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-orange-400">4️⃣ Python调用示例</h3>
+                    <div class="code-box text-xs overflow-x-auto">
+                        <pre class="text-gray-300">from openai import OpenAI
+
+client = OpenAI(
+    api_key="sk-xxx",
+    base_url="{{NEW_API_URL}}/v1"
+)
+
+resp = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role":"user","content":"Hi"}]
+)</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="coupon" class="py-16 px-6 border-t border-gray-800">
+        <div class="max-w-4xl mx-auto">
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>🎫</span> 兑换券领取</h2>
+            <div class="card p-8 glow">
+                <div class="flex flex-col md:flex-row items-center justify-between gap-6">
+                    <div>
+                        <h3 class="text-xl font-bold mb-2">免费领取API额度</h3>
+                        <p class="text-gray-400 mb-3">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次，随机获得对应额度的兑换码</p>
+                        <span class="inline-block bg-green-900/40 text-green-400 px-4 py-1.5 rounded-full border border-green-800 text-sm">📦 当前可领: <b id="avail-cnt">{{AVAILABLE}}</b> 个</span>
+                    </div>
+                    <a href="/claim" target="_top" class="btn btn-primary text-lg px-8 py-3">🎁 立即领取 →</a>
+                </div>
             </div>
         </div>
     </section>
 
     <section class="py-16 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8">🎫 兑换券领取</h2>
-            <div class="card p-8 glow">
-                <div class="flex flex-col md:flex-row items-center justify-between gap-6">
-                    <div>
-                        <h3 class="text-xl font-bold mb-2">免费领取API额度</h3>
-                        <p class="text-gray-400 mb-3">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次</p>
-                        <span class="inline-block bg-green-900/40 text-green-400 px-4 py-1.5 rounded-full border border-green-800 text-sm">📦 当前可领: <b id="avail-cnt">{{AVAILABLE}}</b> 个</span>
-                    </div>
-                    <a href="/claim" class="btn btn-primary text-lg px-8 py-3">🎁 立即领取 →</a>
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>📋</span> 使用须知</h2>
+            <div class="grid md:grid-cols-3 gap-6">
+                <div class="card p-6">
+                    <h3 class="font-semibold mb-3 text-blue-400">✅ 允许使用</h3>
+                    <ul class="text-gray-400 text-sm space-y-1"><li>• 个人学习研究</li><li>• 小型项目开发</li><li>• 合理频率调用</li></ul>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold mb-3 text-red-400">❌ 禁止行为</h3>
+                    <ul class="text-gray-400 text-sm space-y-1"><li>• 商业盈利用途</li><li>• 高频滥用接口</li><li>• 违法违规内容</li></ul>
+                </div>
+                <div class="card p-6">
+                    <h3 class="font-semibold mb-3 text-yellow-400">⚠️ 注意事项</h3>
+                    <ul class="text-gray-400 text-sm space-y-1"><li>• 请勿分享API Key</li><li>• 违规将被封禁</li><li>• 额度用完使用兑换码</li></ul>
                 </div>
             </div>
         </div>
     </section>
 
     <footer class="border-t border-gray-800 py-8 px-6 text-center text-gray-500 text-sm">
-        <p>{{SITE_NAME}} © 2025</p>
+        <p>{{SITE_NAME}} © 2025 | <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">控制台</a> | <a href="{{NEW_API_URL}}/pricing" target="_blank" class="text-blue-400 hover:underline">模型广场</a> | <a href="/claim" target="_top" class="text-blue-400 hover:underline">领券中心</a></p>
     </footer>
 
     <script>
+        function copyAPI(){
+            navigator.clipboard.writeText('{{NEW_API_URL}}');
+            var btn=document.getElementById('copy-btn');
+            btn.textContent='已复制';btn.classList.remove('bg-blue-600');btn.classList.add('bg-green-600');
+            setTimeout(function(){btn.textContent='复制';btn.classList.remove('bg-green-600');btn.classList.add('bg-blue-600');},1500);
+        }
         fetch('/api/stats/public').then(r=>r.json()).then(d=>{
             document.getElementById('avail-cnt').textContent=d.available;
             document.getElementById('cd-text').textContent=d.cooldown_text;
@@ -839,7 +888,7 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root{--bg:#0a0a0f;--card:#12121a;--border:#1f1f2e;--accent:#3b82f6}
-        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif}
+        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif;padding-top:20px}
         .card{background:var(--card);border:1px solid var(--border);border-radius:16px}
         .ipt{background:#0d0d12;border:1px solid var(--border);color:#e0e0e0;border-radius:8px;padding:12px 16px;width:100%;font-size:14px}
         .ipt:focus{border-color:var(--accent);outline:none;box-shadow:0 0 0 2px rgba(59,130,246,0.2)}
@@ -859,8 +908,8 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         .amount-big{font-size:48px;font-weight:800;background:linear-gradient(135deg,#fbbf24,#f59e0b);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
     </style>
 </head>
-<body class="min-h-screen py-8">
-    <main class="max-w-md mx-auto px-4">
+<body class="min-h-screen">
+    <main class="max-w-md mx-auto px-4 py-8">
         <div id="sec-login" class="card p-8">
             <div class="text-center mb-6">
                 <div class="text-5xl mb-4">🎁</div>
@@ -870,13 +919,17 @@ CLAIM_PAGE = '''<!DOCTYPE html>
             </div>
             <div class="space-y-4">
                 <div>
+                    <label class="block text-sm text-gray-400 mb-1">用户ID</label>
+                    <input type="number" id="uid" class="ipt" placeholder="在个人设置页面查看">
+                </div>
+                <div>
                     <label class="block text-sm text-gray-400 mb-1">系统访问令牌</label>
                     <input type="password" id="token" class="ipt" placeholder="请输入系统访问令牌">
-                    <div class="mt-2 p-3 bg-blue-900/20 border border-blue-800 rounded-lg">
-                        <p class="text-xs text-blue-300 mb-2">📍 获取令牌步骤：</p>
-                        <p class="text-xs text-gray-400 mb-2">1. 点击下方按钮进入个人设置<br>2. 找到「安全设置」标签<br>3. 点击「系统访问令牌」的「生成令牌」按钮</p>
-                        <a href="{{NEW_API_URL}}/console/personal" target="_blank" class="btn-link">🔑 前往生成令牌</a>
-                    </div>
+                </div>
+                <div class="p-3 bg-blue-900/20 border border-blue-800 rounded-lg">
+                    <p class="text-xs text-blue-300 mb-2">📍 获取步骤：</p>
+                    <p class="text-xs text-gray-400 mb-2">1. 点击下方按钮进入个人设置<br>2. 查看页面顶部的 <b class="text-blue-300">ID: 数字</b> 即为用户ID<br>3. 找到「安全设置」→「系统访问令牌」→「生成令牌」</p>
+                    <a href="{{NEW_API_URL}}/console/personal" target="_blank" class="btn-link">🔑 前往个人设置</a>
                 </div>
                 <button type="button" class="btn-p" onclick="doVerify()">验证身份</button>
             </div>
@@ -927,12 +980,17 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     </footer>
 
     <script>
-    var accessToken = '';
-    var userInfo = null;
+    var userData = null;
 
     (function(){
-        var saved = localStorage.getItem('coupon_token');
-        if(saved) document.getElementById('token').value = saved;
+        var saved = localStorage.getItem('coupon_auth');
+        if(saved){
+            try{
+                var d = JSON.parse(saved);
+                document.getElementById('uid').value = d.user_id || '';
+                document.getElementById('token').value = d.access_token || '';
+            }catch(e){}
+        }
         fetch('/api/stats/public').then(r=>r.json()).then(d=>{
             document.getElementById('cnt').textContent=d.available;
             document.getElementById('cd-text').textContent=d.cooldown_text;
@@ -949,20 +1007,21 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     }
 
     function doVerify(){
+        var uid=document.getElementById('uid').value.trim();
         var token=document.getElementById('token').value.trim();
+        if(!uid){toast('请填写用户ID',false);return;}
         if(!token){toast('请填写系统访问令牌',false);return;}
         var btn=event.target;
         btn.disabled=true;btn.innerHTML='<span class="ld"></span> 验证中...';
         fetch('/api/verify',{
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({access_token:token})
+            body:JSON.stringify({user_id:parseInt(uid),access_token:token})
         }).then(r=>r.json().then(d=>({ok:r.ok,data:d}))).then(({ok,data})=>{
             btn.disabled=false;btn.textContent='验证身份';
             if(ok&&data.success){
-                accessToken=token;
-                userInfo=data.data;
-                localStorage.setItem('coupon_token',token);
+                userData={user_id:parseInt(uid),access_token:token,username:data.data.username};
+                localStorage.setItem('coupon_auth',JSON.stringify({user_id:uid,access_token:token}));
                 showLogged();
                 loadStatus();
                 toast('验证成功',true);
@@ -975,12 +1034,12 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     function showLogged(){
         document.getElementById('sec-login').style.display='none';
         document.getElementById('sec-claim').style.display='block';
-        document.getElementById('uinfo').textContent=userInfo.username+' (ID:'+userInfo.user_id+')';
+        document.getElementById('uinfo').textContent=userData.username+' (ID:'+userData.user_id+')';
     }
 
     function doLogout(){
-        localStorage.removeItem('coupon_token');
-        accessToken='';userInfo=null;
+        localStorage.removeItem('coupon_auth');
+        userData=null;
         document.getElementById('sec-login').style.display='block';
         document.getElementById('sec-claim').style.display='none';
     }
@@ -989,7 +1048,7 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         fetch('/api/claim/status',{
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({access_token:accessToken})
+            body:JSON.stringify({user_id:userData.user_id,access_token:userData.access_token})
         }).then(r=>r.json()).then(res=>{
             if(res.success)updateUI(res.data);
         }).catch(()=>{});
@@ -1016,7 +1075,7 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         else{
             var html='';
             d.history.forEach(r=>{
-                var statusText=r.auto_redeemed?'<span class="text-green-400 text-xs">已自动充值</span>':'';
+                var statusText=r.auto_redeemed?'<span class="text-green-400 text-xs ml-2">[已自动充值]</span>':'';
                 html+='<div class="cpn text-white"><div class="flex justify-between items-center"><span class="font-mono text-sm">'+r.coupon_code+'</span><span class="bg-white/20 px-2 py-0.5 rounded text-sm">$'+r.quota+'</span></div><div class="flex justify-between items-center mt-1"><span class="text-xs text-blue-200">'+new Date(r.claim_time).toLocaleString('zh-CN')+'</span>'+statusText+'</div></div>';
             });
             h.innerHTML=html;
@@ -1030,7 +1089,7 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         fetch('/api/claim',{
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({access_token:accessToken})
+            body:JSON.stringify({user_id:userData.user_id,access_token:userData.access_token})
         }).then(r=>r.json().then(d=>({ok:r.ok,data:d}))).then(({ok,data})=>{
             btn.innerHTML='🎰 抽取兑换券';
             if(ok&&data.success){
@@ -1263,11 +1322,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     <div id="toast"></div>
 
     <script>
-    var adminPwd='';
-    var currentWeights={};
-    var selectedCoupons=new Set();
-    var currentPage=1;
-    var currentMode='A';
+    var adminPwd='';var currentWeights={};var selectedCoupons=new Set();var currentPage=1;var currentMode='A';
 
     (function(){
         var saved=sessionStorage.getItem('admin_pwd');
@@ -1275,11 +1330,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         document.getElementById('loginPwd').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
     })();
 
-    function toast(msg,ok){
-        var t=document.getElementById('toast');
-        t.textContent=msg;t.style.display='block';t.style.background=ok?'#10b981':'#ef4444';
-        setTimeout(()=>t.style.display='none',3000);
-    }
+    function toast(msg,ok){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';t.style.background=ok?'#10b981':'#ef4444';setTimeout(()=>t.style.display='none',3000);}
 
     function doLogin(){
         var pwd=document.getElementById('loginPwd').value;
@@ -1346,8 +1397,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
             html+='</div>';
         });
         document.getElementById('couponList').innerHTML=html||'<p class="text-gray-500 text-center py-4">暂无数据</p>';
-        var phtml='';
-        for(var i=1;i<=data.pages;i++){phtml+='<button class="px-3 py-1 rounded '+(i===data.page?'bg-blue-600':'bg-gray-700')+'" onclick="loadCoupons('+i+')">'+i+'</button>';}
+        var phtml='';for(var i=1;i<=data.pages;i++){phtml+='<button class="px-3 py-1 rounded '+(i===data.page?'bg-blue-600':'bg-gray-700')+'" onclick="loadCoupons('+i+')">'+i+'</button>';}
         document.getElementById('pagination').innerHTML=phtml;
     }
 
@@ -1355,24 +1405,11 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     function toggleSelectAll(){var checked=document.getElementById('selectAllCheck').checked;document.querySelectorAll('#couponList input[type=checkbox]').forEach(cb=>{cb.checked=checked;var id=parseInt(cb.dataset.id);if(checked)selectedCoupons.add(id);else selectedCoupons.delete(id);});}
     function selectAllCoupons(){document.getElementById('selectAllCheck').checked=true;toggleSelectAll();}
 
-    function deleteCoupon(id){
-        if(!confirm('确定删除？'))return;
-        fetch('/api/admin/delete-coupon',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,id:id})})
-        .then(r=>r.json()).then(d=>{toast(d.message,d.success);if(d.success)loadCoupons(currentPage);});
-    }
+    function deleteCoupon(id){if(!confirm('确定删除？'))return;fetch('/api/admin/delete-coupon',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,id:id})}).then(r=>r.json()).then(d=>{toast(d.message,d.success);if(d.success)loadCoupons(currentPage);});}
 
-    function deleteSelected(){
-        if(selectedCoupons.size===0){toast('请先选择',false);return;}
-        if(!confirm('确定删除选中的 '+selectedCoupons.size+' 个？'))return;
-        fetch('/api/admin/delete-coupons-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,ids:Array.from(selectedCoupons),type:'selected'})})
-        .then(r=>r.json()).then(d=>{toast(d.message,d.success);if(d.success)loadCoupons(currentPage);});
-    }
+    function deleteSelected(){if(selectedCoupons.size===0){toast('请先选择',false);return;}if(!confirm('确定删除选中的 '+selectedCoupons.size+' 个？'))return;fetch('/api/admin/delete-coupons-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,ids:Array.from(selectedCoupons),type:'selected'})}).then(r=>r.json()).then(d=>{toast(d.message,d.success);if(d.success)loadCoupons(currentPage);});}
 
-    function deleteBatch(type){
-        if(!confirm('确定删除？'))return;
-        fetch('/api/admin/delete-coupons-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,type:type})})
-        .then(r=>r.json()).then(d=>{toast(d.message,d.success);if(d.success)loadCoupons(1);});
-    }
+    function deleteBatch(type){if(!confirm('确定删除？'))return;fetch('/api/admin/delete-coupons-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,type:type})}).then(r=>r.json()).then(d=>{toast(d.message,d.success);if(d.success)loadCoupons(1);});}
 
     function renderWeights(weights){
         currentWeights={};for(var k in weights)currentWeights[k]=weights[k];
@@ -1385,85 +1422,41 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 
     function updateWeight(key,val){currentWeights[key]=parseFloat(val)||0;}
     function removeWeight(key){delete currentWeights[key];renderWeights(currentWeights);}
-    function addWeight(){
-        var key=document.getElementById('newQuotaKey').value;
-        var val=document.getElementById('newQuotaWeight').value;
-        if(!key||!val){toast('请输入额度和权重',false);return;}
-        currentWeights[key]=parseFloat(val);
-        renderWeights(currentWeights);
-        document.getElementById('newQuotaKey').value='';
-        document.getElementById('newQuotaWeight').value='';
-    }
+    function addWeight(){var key=document.getElementById('newQuotaKey').value;var val=document.getElementById('newQuotaWeight').value;if(!key||!val){toast('请输入额度和权重',false);return;}currentWeights[key]=parseFloat(val);renderWeights(currentWeights);document.getElementById('newQuotaKey').value='';document.getElementById('newQuotaWeight').value='';}
 
-    function toggleMode(){
-        currentMode=currentMode==='A'?'B':'A';
-        updateModeUI();
-        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,claim_mode:currentMode})})
-        .then(r=>r.json()).then(d=>toast(d.message,d.success));
-    }
+    function toggleMode(){currentMode=currentMode==='A'?'B':'A';updateModeUI();fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,claim_mode:currentMode})}).then(r=>r.json()).then(d=>toast(d.message,d.success));}
 
     function updateModeUI(){
-        var sw=document.getElementById('modeSwitch');
-        var desc=document.getElementById('modeDesc');
-        if(currentMode==='B'){
-            sw.classList.add('on');
-            desc.innerHTML='<b>模式B（自动充值）</b>：用户领取后，系统自动调用 API 创建兑换码并充值到用户账户';
-        }else{
-            sw.classList.remove('on');
-            desc.innerHTML='<b>模式A（返回兑换码）</b>：优先使用本地兑换码，没有则调用 API 创建，用户需自行兑换';
-        }
+        var sw=document.getElementById('modeSwitch');var desc=document.getElementById('modeDesc');
+        if(currentMode==='B'){sw.classList.add('on');desc.innerHTML='<b>模式B（自动充值）</b>：用户领取后，系统自动调用 API 创建兑换码并充值到用户账户';}
+        else{sw.classList.remove('on');desc.innerHTML='<b>模式A（返回兑换码）</b>：优先使用本地兑换码，没有则调用 API 创建，用户需自行兑换';}
     }
 
-    function saveCooldownConfig(){
-        var minutes=parseInt(document.getElementById('cooldownMinutes').value);
-        var times=parseInt(document.getElementById('claimTimes').value);
-        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,cooldown_minutes:minutes,claim_times:times})})
-        .then(r=>r.json()).then(d=>toast(d.message,d.success));
-    }
+    function saveCooldownConfig(){var minutes=parseInt(document.getElementById('cooldownMinutes').value);var times=parseInt(document.getElementById('claimTimes').value);fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,cooldown_minutes:minutes,claim_times:times})}).then(r=>r.json()).then(d=>toast(d.message,d.success));}
 
-    function saveDisplayConfig(){
-        var count=parseInt(document.getElementById('displayCount').value);
-        var rate=parseInt(document.getElementById('quotaRate').value);
-        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,display_count:count,quota_rate:rate})})
-        .then(r=>r.json()).then(d=>toast(d.message,d.success));
-    }
+    function saveDisplayConfig(){var count=parseInt(document.getElementById('displayCount').value);var rate=parseInt(document.getElementById('quotaRate').value);fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,display_count:count,quota_rate:rate})}).then(r=>r.json()).then(d=>toast(d.message,d.success));}
 
-    function saveWeights(){
-        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,quota_weights:currentWeights})})
-        .then(r=>r.json()).then(d=>toast(d.message,d.success));
-    }
+    function saveWeights(){fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,quota_weights:currentWeights})}).then(r=>r.json()).then(d=>toast(d.message,d.success));}
 
     function loadStats(){
         fetch('/api/admin/stats?password='+encodeURIComponent(adminPwd)).then(r=>r.json()).then(res=>{
-            if(!res.success)return;
-            var d=res.data;
+            if(!res.success)return;var d=res.data;
             document.getElementById('cooldownMinutes').value=d.cooldown_minutes;
             document.getElementById('claimTimes').value=d.claim_times;
             document.getElementById('displayCount').value=d.display_count;
             document.getElementById('quotaRate').value=d.quota_rate;
-            currentMode=d.claim_mode;
-            updateModeUI();
-            renderWeights(d.quota_weights);
-            
+            currentMode=d.claim_mode;updateModeUI();renderWeights(d.quota_weights);
             var tokenStatus=document.getElementById('tokenStatus');
             tokenStatus.textContent=d.admin_token_configured?'✅ 已配置管理员令牌':'❌ 未配置管理员令牌';
             tokenStatus.className='text-xs mt-1 '+(d.admin_token_configured?'text-green-400':'text-red-400');
-
             var h='<div class="grid grid-cols-3 gap-4 mb-6">';
             h+='<div class="bg-gray-800 p-4 rounded-lg text-center"><div class="text-2xl font-bold">'+d.total+'</div><div class="text-gray-500 text-sm">本地总数</div></div>';
             h+='<div class="bg-green-900/30 p-4 rounded-lg text-center border border-green-800"><div class="text-2xl font-bold text-green-400">'+d.display_count+'</div><div class="text-gray-500 text-sm">显示可领</div></div>';
             h+='<div class="bg-blue-900/30 p-4 rounded-lg text-center border border-blue-800"><div class="text-2xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-gray-500 text-sm">已领取</div></div>';
-            h+='</div>';
-            h+='<div class="space-y-2">';
+            h+='</div><div class="space-y-2">';
             for(var k in d.quota_stats){var v=d.quota_stats[k];h+='<div class="flex justify-between text-sm bg-gray-800/50 p-3 rounded"><span class="font-bold">'+k+'</span><span class="text-green-400">本地可用: '+v.available+'</span><span class="text-gray-500">已领: '+v.claimed+'</span></div>';}
-            h+='</div>';
-            document.getElementById('statsBox').innerHTML=h;
-
-            var rh='';
-            d.recent_claims.forEach(c=>{
-                var autoTag=c.auto_redeemed?'<span class="text-green-400 text-xs">[自动充值]</span>':'';
-                rh+='<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span> '+autoTag+'<br><span class="text-gray-600 text-xs">'+c.time+'</span></div>';
-            });
+            h+='</div>';document.getElementById('statsBox').innerHTML=h;
+            var rh='';d.recent_claims.forEach(c=>{var autoTag=c.auto_redeemed?'<span class="text-green-400 text-xs">[自动]</span>':'';rh+='<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span> '+autoTag+'<br><span class="text-gray-600 text-xs">'+c.time+'</span></div>';});
             document.getElementById('recentBox').innerHTML=rh||'<p class="text-gray-600">暂无</p>';
         });
     }
