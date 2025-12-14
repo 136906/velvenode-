@@ -88,37 +88,49 @@ async def verify_user_identity(user_id: int, username: str, api_key: str) -> boo
     except:
         return False
 
-# ============ API ============
+# ============ 用户 API ============
 @app.post("/api/verify")
 async def verify_user(request: Request):
     body = await request.json()
-    user_id, username, api_key = body.get("user_id"), body.get("username", "").strip(), body.get("api_key", "").strip()
+    user_id = body.get("user_id")
+    username = body.get("username", "").strip()
+    api_key = body.get("api_key", "").strip()
+    
     if not user_id or not username or not api_key:
         raise HTTPException(status_code=400, detail="请填写完整信息")
     try:
         user_id = int(user_id)
     except:
         raise HTTPException(status_code=400, detail="用户ID必须是数字")
+    
     if not await verify_user_identity(user_id, username, api_key):
         raise HTTPException(status_code=401, detail="API Key 无效或已过期")
+    
     return {"success": True, "data": {"user_id": user_id, "username": username}}
 
 @app.post("/api/claim/status")
 async def get_claim_status(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
-    user_id, username, api_key = body.get("user_id"), body.get("username", "").strip(), body.get("api_key", "").strip()
+    user_id = body.get("user_id")
+    username = body.get("username", "").strip()
+    api_key = body.get("api_key", "").strip()
+    
     if not user_id or not username or not api_key:
         raise HTTPException(status_code=400, detail="请填写完整信息")
     try:
         user_id = int(user_id)
     except:
         raise HTTPException(status_code=400, detail="用户ID必须是数字")
+    
     if not await verify_user_identity(user_id, username, api_key):
         raise HTTPException(status_code=401, detail="API Key 无效")
     
     now = now_utc()
     last_claim = db.query(ClaimRecord).filter(ClaimRecord.user_id == user_id).order_by(ClaimRecord.claim_time.desc()).first()
-    can_claim, cooldown_text = True, None
+    
+    can_claim = True
+    cooldown_text = None
+    
     if last_claim:
         last_time = last_claim.claim_time.replace(tzinfo=timezone.utc) if last_claim.claim_time.tzinfo is None else last_claim.claim_time
         next_claim_time = last_time + timedelta(hours=CLAIM_COOLDOWN_HOURS)
@@ -126,55 +138,85 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
             can_claim = False
             remaining = next_claim_time - now
             total_seconds = int(remaining.total_seconds())
-            h, m, s = total_seconds // 3600, (total_seconds % 3600) // 60, total_seconds % 60
+            h = total_seconds // 3600
+            m = (total_seconds % 3600) // 60
+            s = total_seconds % 60
             cooldown_text = f"{h}小时 {m}分钟 {s}秒"
     
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     if available == 0:
-        can_claim, cooldown_text = False, "兑换码已领完，请等待补充"
-    
-    quota_stats = {}
-    for q in [1, 5, 10, 50, 100]:
-        cnt = db.query(CouponPool).filter(CouponPool.is_claimed == False, CouponPool.quota_dollars == q).count()
-        if cnt > 0:
-            quota_stats[f"${q}"] = cnt
+        can_claim = False
+        cooldown_text = "兑换码已领完，请等待补充"
     
     history = db.query(ClaimRecord).filter(ClaimRecord.user_id == user_id).order_by(ClaimRecord.claim_time.desc()).limit(10).all()
-    return {"success": True, "data": {"can_claim": can_claim, "cooldown_text": cooldown_text, "available_count": available, "quota_stats": quota_stats, "history": [{"coupon_code": r.coupon_code, "quota": r.quota_dollars, "claim_time": r.claim_time.isoformat()} for r in history]}}
+    
+    return {
+        "success": True,
+        "data": {
+            "can_claim": can_claim,
+            "cooldown_text": cooldown_text,
+            "available_count": available,
+            "history": [
+                {
+                    "coupon_code": r.coupon_code,
+                    "quota": r.quota_dollars,
+                    "claim_time": r.claim_time.isoformat()
+                } for r in history
+            ]
+        }
+    }
 
 @app.post("/api/claim")
 async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
-    user_id, username, api_key = body.get("user_id"), body.get("username", "").strip(), body.get("api_key", "").strip()
+    user_id = body.get("user_id")
+    username = body.get("username", "").strip()
+    api_key = body.get("api_key", "").strip()
+    
     if not user_id or not username or not api_key:
         raise HTTPException(status_code=400, detail="请填写完整信息")
     try:
         user_id = int(user_id)
     except:
         raise HTTPException(status_code=400, detail="用户ID必须是数字")
+    
     if not await verify_user_identity(user_id, username, api_key):
         raise HTTPException(status_code=401, detail="API Key 无效")
     
     now = now_utc()
     last_claim = db.query(ClaimRecord).filter(ClaimRecord.user_id == user_id).order_by(ClaimRecord.claim_time.desc()).first()
+    
     if last_claim:
         last_time = last_claim.claim_time.replace(tzinfo=timezone.utc) if last_claim.claim_time.tzinfo is None else last_claim.claim_time
         next_claim_time = last_time + timedelta(hours=CLAIM_COOLDOWN_HOURS)
         if now < next_claim_time:
             remaining = next_claim_time - now
-            h, m = int(remaining.total_seconds()) // 3600, (int(remaining.total_seconds()) % 3600) // 60
+            h = int(remaining.total_seconds()) // 3600
+            m = (int(remaining.total_seconds()) % 3600) // 60
             raise HTTPException(status_code=400, detail=f"冷却中，请在 {h}小时 {m}分钟 后再试")
     
     coupon = get_random_coupon(db)
     if not coupon:
         raise HTTPException(status_code=400, detail="兑换码已领完")
     
-    coupon.is_claimed, coupon.claimed_by_user_id, coupon.claimed_by_username, coupon.claimed_at = True, user_id, username, now
-    record = ClaimRecord(user_id=user_id, username=username, coupon_code=coupon.coupon_code, quota_dollars=coupon.quota_dollars, claim_time=now)
+    coupon.is_claimed = True
+    coupon.claimed_by_user_id = user_id
+    coupon.claimed_by_username = username
+    coupon.claimed_at = now
+    
+    record = ClaimRecord(
+        user_id=user_id,
+        username=username,
+        coupon_code=coupon.coupon_code,
+        quota_dollars=coupon.quota_dollars,
+        claim_time=now
+    )
     db.add(record)
     db.commit()
+    
     return {"success": True, "data": {"coupon_code": coupon.coupon_code, "quota": coupon.quota_dollars}}
 
+# ============ 管理员 API ============
 @app.post("/api/admin/login")
 async def admin_login(request: Request):
     body = await request.json()
@@ -185,25 +227,34 @@ async def admin_login(request: Request):
 @app.post("/api/admin/add-coupons")
 async def add_coupons(request: Request, db: Session = Depends(get_db)):
     body = await request.json()
-    if body.get("password") != ADMIN_PASSWORD:
+    password = body.get("password", "")
+    coupons = body.get("coupons", [])
+    quota = float(body.get("quota", 1))
+    
+    if password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
-    coupons, quota = body.get("coupons", []), float(body.get("quota", 1))
+    
     added = 0
     for code in coupons:
         code = code.strip()
-        if code and not db.query(CouponPool).filter(CouponPool.coupon_code == code).first():
+        if not code:
+            continue
+        if not db.query(CouponPool).filter(CouponPool.coupon_code == code).first():
             db.add(CouponPool(coupon_code=code, quota_dollars=quota))
             added += 1
     db.commit()
+    
     total = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
-    return {"success": True, "message": f"成功添加 {added} 个 ${quota} 兑换码，当前可用: {total} 个"}
+    return {"success": True, "message": f"成功添加 {added} 个兑换码，当前可用: {total} 个"}
 
 @app.post("/api/admin/upload-txt")
 async def upload_txt(password: str = Form(...), quota: float = Form(1), file: UploadFile = File(...), db: Session = Depends(get_db)):
     if password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
+    
     content = await file.read()
     lines = content.decode("utf-8").strip().split("\n")
+    
     added = 0
     for line in lines:
         code = line.strip()
@@ -211,40 +262,73 @@ async def upload_txt(password: str = Form(...), quota: float = Form(1), file: Up
             db.add(CouponPool(coupon_code=code, quota_dollars=quota))
             added += 1
     db.commit()
+    
     total = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
-    return {"success": True, "message": f"成功添加 {added} 个 ${quota} 兑换码，当前可用: {total} 个"}
+    return {"success": True, "message": f"成功添加 {added} 个兑换码，当前可用: {total} 个"}
 
 @app.get("/api/admin/stats")
 async def get_stats(password: str, db: Session = Depends(get_db)):
     if password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
+    
     total = db.query(CouponPool).count()
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     claimed = db.query(CouponPool).filter(CouponPool.is_claimed == True).count()
+    
     quota_stats = {}
     for q in [1, 5, 10, 50, 100]:
         avail = db.query(CouponPool).filter(CouponPool.is_claimed == False, CouponPool.quota_dollars == q).count()
         used = db.query(CouponPool).filter(CouponPool.is_claimed == True, CouponPool.quota_dollars == q).count()
         if avail > 0 or used > 0:
             quota_stats[f"${q}"] = {"available": avail, "claimed": used}
+    
     recent = db.query(ClaimRecord).order_by(ClaimRecord.claim_time.desc()).limit(50).all()
-    return {"success": True, "data": {"total": total, "available": available, "claimed": claimed, "quota_stats": quota_stats, "recent_claims": [{"user_id": r.user_id, "username": r.username, "quota": r.quota_dollars, "code": r.coupon_code[:8]+"...", "time": r.claim_time.strftime("%m-%d %H:%M") if r.claim_time else ""} for r in recent]}}
+    
+    return {
+        "success": True,
+        "data": {
+            "total": total,
+            "available": available,
+            "claimed": claimed,
+            "quota_stats": quota_stats,
+            "recent_claims": [
+                {
+                    "user_id": r.user_id,
+                    "username": r.username,
+                    "quota": r.quota_dollars,
+                    "code": r.coupon_code[:8] + "...",
+                    "time": r.claim_time.strftime("%m-%d %H:%M") if r.claim_time else ""
+                } for r in recent
+            ]
+        }
+    }
 
 @app.get("/api/stats/public")
 async def get_public_stats(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     return {"available": available, "cooldown_hours": CLAIM_COOLDOWN_HOURS}
 
-# ============ 页面 ============
+# ============ 页面路由 ============
 @app.get("/", response_class=HTMLResponse)
 async def index(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
-    return HOME_PAGE.replace("{{AVAILABLE}}", str(available)).replace("{{SITE_NAME}}", SITE_NAME).replace("{{NEW_API_URL}}", NEW_API_URL).replace("{{COOLDOWN}}", str(CLAIM_COOLDOWN_HOURS)).replace("{{COUPON_SITE_URL}}", COUPON_SITE_URL)
+    html = HOME_PAGE
+    html = html.replace("{{AVAILABLE}}", str(available))
+    html = html.replace("{{SITE_NAME}}", SITE_NAME)
+    html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
+    html = html.replace("{{COOLDOWN}}", str(CLAIM_COOLDOWN_HOURS))
+    html = html.replace("{{COUPON_SITE_URL}}", COUPON_SITE_URL)
+    return html
 
 @app.get("/claim", response_class=HTMLResponse)
 async def claim_page(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
-    return CLAIM_PAGE.replace("{{AVAILABLE}}", str(available)).replace("{{SITE_NAME}}", SITE_NAME).replace("{{NEW_API_URL}}", NEW_API_URL).replace("{{COOLDOWN}}", str(CLAIM_COOLDOWN_HOURS))
+    html = CLAIM_PAGE
+    html = html.replace("{{AVAILABLE}}", str(available))
+    html = html.replace("{{SITE_NAME}}", SITE_NAME)
+    html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
+    html = html.replace("{{COOLDOWN}}", str(CLAIM_COOLDOWN_HOURS))
+    return html
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page():
@@ -253,59 +337,152 @@ async def admin_page():
 @app.get("/widget", response_class=HTMLResponse)
 async def widget_page(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
-    return WIDGET_PAGE.replace("{{AVAILABLE}}", str(available)).replace("{{COUPON_SITE_URL}}", COUPON_SITE_URL)
+    html = WIDGET_PAGE
+    html = html.replace("{{AVAILABLE}}", str(available))
+    html = html.replace("{{COUPON_SITE_URL}}", COUPON_SITE_URL)
+    return html
 
-# ============ 首页 - 完整版 ============
+# ============ 首页 HTML ============
 HOME_PAGE = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{SITE_NAME}} - API服务</title>
+    <title>{{SITE_NAME}} - 统一的大模型API网关</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        :root{--bg:#0a0a0f;--card:#13131a;--border:#1e1e2a;--accent:#3b82f6;--text:#e0e0e0;--muted:#6b7280}
-        body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif}
-        .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
-        .btn{padding:10px 20px;border-radius:8px;font-weight:500;transition:all .2s;display:inline-flex;align-items:center;gap:6px}
-        .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
-        .btn-outline{border:1px solid var(--border);color:var(--text)}.btn-outline:hover{background:var(--card);border-color:var(--accent)}
-        .glow{box-shadow:0 0 40px rgba(59,130,246,0.15)}
-        .code-box{background:#0d0d12;border:1px solid var(--border);border-radius:8px;padding:12px 16px;font-family:monospace;position:relative}
-        .copy-btn{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:var(--accent);color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px}
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-card: #12121a;
+            --border: #1f1f2e;
+            --accent: #3b82f6;
+            --text: #e0e0e0;
+            --muted: #6b7280;
+        }
+        body {
+            background: var(--bg-primary);
+            color: var(--text);
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+        }
+        .btn {
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-weight: 500;
+            transition: all 0.2s;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            border: none;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: #fff;
+        }
+        .btn-primary:hover {
+            background: #2563eb;
+        }
+        .btn-secondary {
+            background: #1f1f2e;
+            color: var(--text);
+            border: 1px solid #2a2a3a;
+        }
+        .btn-secondary:hover {
+            background: #2a2a3a;
+        }
+        .code-box {
+            background: #0d0d12;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px 18px;
+            font-family: ui-monospace, monospace;
+        }
+        .glow {
+            box-shadow: 0 0 40px rgba(59, 130, 246, 0.15);
+        }
+        /* 接口轮播动画 */
+        .endpoint-container {
+            height: 24px;
+            overflow: hidden;
+            display: inline-block;
+        }
+        .endpoint-slider {
+            animation: slideEndpoints 12s infinite;
+        }
+        .endpoint-item {
+            height: 24px;
+            line-height: 24px;
+        }
+        @keyframes slideEndpoints {
+            0%, 16% { transform: translateY(0); }
+            20%, 36% { transform: translateY(-24px); }
+            40%, 56% { transform: translateY(-48px); }
+            60%, 76% { transform: translateY(-72px); }
+            80%, 96% { transform: translateY(-96px); }
+            100% { transform: translateY(0); }
+        }
     </style>
 </head>
 <body class="min-h-screen">
-    <!-- 导航 -->
+    <!-- 导航栏 -->
     <nav class="border-b border-gray-800 py-4 px-6">
-        <div class="max-w-6xl mx-auto flex justify-between items-center">
+        <div class="max-w-5xl mx-auto flex justify-between items-center">
             <div class="flex items-center gap-2">
                 <span class="text-2xl">⚡</span>
                 <span class="font-bold text-xl">{{SITE_NAME}}</span>
             </div>
-            <div class="flex items-center gap-4">
-                <a href="#api" class="text-gray-400 hover:text-white transition">API接入</a>
-                <a href="#coupon" class="text-gray-400 hover:text-white transition">领券中心</a>
-                <a href="{{NEW_API_URL}}" target="_blank" class="btn btn-primary text-sm">控制台 →</a>
+            <div class="flex items-center gap-6">
+                <a href="#api" class="text-gray-400 hover:text-white text-sm transition">API接入</a>
+                <a href="{{NEW_API_URL}}/pricing" target="_blank" class="text-gray-400 hover:text-white text-sm transition">模型广场</a>
+                <a href="{{NEW_API_URL}}/console" target="_blank" class="btn btn-primary text-sm">控制台 →</a>
             </div>
         </div>
     </nav>
 
-    <!-- Hero -->
+    <!-- Hero 区域 -->
     <section class="py-20 px-6">
-        <div class="max-w-4xl mx-auto text-center">
+        <div class="max-w-3xl mx-auto text-center">
             <h1 class="text-4xl md:text-5xl font-bold mb-4 bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">
                 统一的大模型API网关
             </h1>
-            <p class="text-xl text-gray-400 mb-8">更低的价格，更稳定的服务，只需替换API地址即可使用</p>
-            <div class="code-box max-w-xl mx-auto text-left mb-8">
-                <span class="text-gray-500">API地址:</span>
-                <span class="text-blue-400 ml-2" id="api-url">{{NEW_API_URL}}/v1</span>
-                <button class="copy-btn" onclick="copyText('{{NEW_API_URL}}/v1')">复制</button>
+            <p class="text-lg text-gray-400 mb-10">更低的价格，更稳定的服务，只需替换API地址即可使用</p>
+            
+            <!-- API地址展示 -->
+            <div class="code-box max-w-2xl mx-auto mb-8">
+                <div class="flex items-center justify-between flex-wrap gap-4">
+                    <div class="flex items-center gap-2 text-sm">
+                        <span class="text-gray-500">API地址:</span>
+                        <span class="text-blue-400" id="api-base">{{NEW_API_URL}}</span>
+                        <div class="endpoint-container">
+                            <div class="endpoint-slider">
+                                <div class="endpoint-item text-cyan-400">/v1/chat/completions</div>
+                                <div class="endpoint-item text-cyan-400">/v1/models</div>
+                                <div class="endpoint-item text-cyan-400">/v1/embeddings</div>
+                                <div class="endpoint-item text-cyan-400">/v1/images/generations</div>
+                                <div class="endpoint-item text-cyan-400">/v1/audio/transcriptions</div>
+                            </div>
+                        </div>
+                    </div>
+                    <button onclick="copyAPI()" id="copy-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded transition">
+                        复制
+                    </button>
+                </div>
             </div>
+            
+            <!-- 主要按钮 -->
             <div class="flex justify-center gap-4 flex-wrap">
-                <a href="{{NEW_API_URL}}" target="_blank" class="btn btn-primary">🚀 获取API Key</a>
-                <a href="/claim" class="btn btn-outline">🎫 领取兑换券</a>
+                <a href="{{NEW_API_URL}}/console/token" target="_blank" class="btn btn-primary text-base">
+                    🔑 获取API Key
+                </a>
+                <a href="/claim" class="btn btn-secondary text-base">
+                    🎫 领取兑换券
+                </a>
             </div>
         </div>
     </section>
@@ -313,40 +490,44 @@ HOME_PAGE = '''<!DOCTYPE html>
     <!-- API接入教程 -->
     <section id="api" class="py-16 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2">📖 API接入教程</h2>
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2">
+                <span>📖</span> API接入教程
+            </h2>
             
             <div class="grid md:grid-cols-2 gap-6">
+                <!-- 获取API Key -->
                 <div class="card p-6">
                     <h3 class="font-semibold text-lg mb-4 text-blue-400">1️⃣ 获取API Key</h3>
                     <ol class="space-y-2 text-gray-400 text-sm">
-                        <li>1. 访问 <a href="{{NEW_API_URL}}" target="_blank" class="text-blue-400 hover:underline">{{SITE_NAME}}控制台</a></li>
+                        <li>1. 访问 <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">{{SITE_NAME}}控制台</a></li>
                         <li>2. 注册/登录账号</li>
-                        <li>3. 进入「令牌管理」创建API Key</li>
+                        <li>3. 进入「<a href="{{NEW_API_URL}}/console/token" target="_blank" class="text-blue-400 hover:underline">令牌管理</a>」创建API Key</li>
                         <li>4. 复制生成的 sk-xxx 密钥</li>
                     </ol>
                 </div>
                 
+                <!-- 配置API地址 -->
                 <div class="card p-6">
                     <h3 class="font-semibold text-lg mb-4 text-green-400">2️⃣ 配置API地址</h3>
-                    <div class="space-y-3 text-sm">
-                        <div class="code-box text-xs">
-                            <div class="text-gray-500 mb-1"># API Base URL</div>
-                            <div class="text-green-400">{{NEW_API_URL}}/v1</div>
-                        </div>
-                        <p class="text-gray-400">将此地址替换到你的应用中即可</p>
+                    <div class="code-box text-sm mb-3">
+                        <div class="text-gray-500"># API Base URL</div>
+                        <div class="text-green-400">{{NEW_API_URL}}</div>
                     </div>
+                    <p class="text-gray-400 text-sm">将此地址替换到你的应用中即可</p>
                 </div>
                 
+                <!-- ChatGPT-Next-Web -->
                 <div class="card p-6">
                     <h3 class="font-semibold text-lg mb-4 text-purple-400">3️⃣ ChatGPT-Next-Web</h3>
                     <ol class="space-y-2 text-gray-400 text-sm">
                         <li>1. 设置 → 自定义接口</li>
-                        <li>2. 接口地址: <code class="text-purple-400">{{NEW_API_URL}}</code></li>
+                        <li>2. 接口地址: <code class="text-purple-400 bg-purple-900/30 px-1 rounded">{{NEW_API_URL}}</code></li>
                         <li>3. API Key: 填入你的密钥</li>
                         <li>4. 保存即可使用</li>
                     </ol>
                 </div>
                 
+                <!-- Python示例 -->
                 <div class="card p-6">
                     <h3 class="font-semibold text-lg mb-4 text-orange-400">4️⃣ Python调用示例</h3>
                     <div class="code-box text-xs overflow-x-auto">
@@ -370,19 +551,18 @@ resp = client.chat.completions.create(
     <!-- 兑换券入口 -->
     <section id="coupon" class="py-16 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2">🎫 兑换券领取</h2>
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2">
+                <span>🎫</span> 兑换券领取
+            </h2>
             
             <div class="card p-8 glow">
                 <div class="flex flex-col md:flex-row items-center justify-between gap-6">
                     <div>
                         <h3 class="text-xl font-bold mb-2">免费领取API额度</h3>
-                        <p class="text-gray-400 mb-2">每 {{COOLDOWN}} 小时可领取一次，随机获得 $1~$100 额度</p>
-                        <div class="flex items-center gap-4 text-sm">
-                            <span class="bg-green-900/50 text-green-400 px-3 py-1 rounded-full border border-green-700">
-                                📦 当前可领: <b>{{AVAILABLE}}</b> 个
-                            </span>
-                            <span class="text-gray-500">🎰 大额低概率</span>
-                        </div>
+                        <p class="text-gray-400 mb-3">每 {{COOLDOWN}} 小时可领取一次，随机获得对应额度的兑换码</p>
+                        <span class="inline-block bg-green-900/40 text-green-400 px-4 py-1.5 rounded-full border border-green-800 text-sm">
+                            📦 当前可领: <b>{{AVAILABLE}}</b> 个
+                        </span>
                     </div>
                     <a href="/claim" class="btn btn-primary text-lg px-8 py-3">
                         🎁 立即领取 →
@@ -395,7 +575,10 @@ resp = client.chat.completions.create(
     <!-- 使用须知 -->
     <section class="py-16 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2">📋 使用须知</h2>
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2">
+                <span>📋</span> 使用须知
+            </h2>
+            
             <div class="grid md:grid-cols-3 gap-6">
                 <div class="card p-6">
                     <h3 class="font-semibold mb-3 text-blue-400">✅ 允许使用</h3>
@@ -425,23 +608,36 @@ resp = client.chat.completions.create(
         </div>
     </section>
 
-    <!-- Footer -->
+    <!-- 页脚 -->
     <footer class="border-t border-gray-800 py-8 px-6 text-center text-gray-500 text-sm">
-        <p>{{SITE_NAME}} © 2025 | <a href="{{NEW_API_URL}}" class="text-blue-400 hover:underline">控制台</a> | <a href="/claim" class="text-blue-400 hover:underline">领券中心</a></p>
+        <p>
+            {{SITE_NAME}} © 2025 | 
+            <a href="{{NEW_API_URL}}/console" class="text-blue-400 hover:underline">控制台</a> | 
+            <a href="{{NEW_API_URL}}/pricing" class="text-blue-400 hover:underline">模型广场</a> | 
+            <a href="/claim" class="text-blue-400 hover:underline">领券中心</a>
+        </p>
     </footer>
 
     <script>
-        function copyText(text) {
-            navigator.clipboard.writeText(text);
-            const btn = event.target;
-            btn.textContent = '已复制';
-            setTimeout(() => btn.textContent = '复制', 1500);
+        function copyAPI() {
+            var url = '{{NEW_API_URL}}';
+            navigator.clipboard.writeText(url).then(function() {
+                var btn = document.getElementById('copy-btn');
+                btn.textContent = '已复制';
+                btn.classList.remove('bg-blue-600');
+                btn.classList.add('bg-green-600');
+                setTimeout(function() {
+                    btn.textContent = '复制';
+                    btn.classList.remove('bg-green-600');
+                    btn.classList.add('bg-blue-600');
+                }, 1500);
+            });
         }
     </script>
 </body>
 </html>'''
 
-# ============ 兑换券领取页 ============
+# ============ 兑换券领取页 HTML ============
 CLAIM_PAGE = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -450,40 +646,134 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     <title>兑换券领取 - {{SITE_NAME}}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        :root{--bg:#0a0a0f;--card:#13131a;--border:#1e1e2a;--accent:#3b82f6}
-        body{background:var(--bg);color:#e0e0e0}
-        .card{background:var(--card);border:1px solid var(--border);border-radius:16px}
-        .input-dark{background:#0d0d12;border:1px solid var(--border);color:#e0e0e0;border-radius:8px;padding:12px 16px;width:100%}
-        .input-dark:focus{border-color:var(--accent);outline:none;box-shadow:0 0 0 2px rgba(59,130,246,0.2)}
-        .btn-primary{background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;padding:12px 24px;border-radius:8px;font-weight:600;border:none;cursor:pointer;width:100%}
-        .btn-primary:hover{background:linear-gradient(135deg,#2563eb,#1e40af)}
-        .btn-primary:disabled{background:#374151;cursor:not-allowed}
-        .btn-claim{background:linear-gradient(135deg,#10b981,#059669);color:#fff;padding:16px 32px;border-radius:12px;font-weight:700;font-size:18px;border:none;cursor:pointer}
-        .btn-claim:hover{transform:scale(1.02)}
-        .btn-claim:disabled{background:#374151;cursor:not-allowed;transform:none}
-        .loading{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.3);border-radius:50%;border-top-color:#fff;animation:spin 1s linear infinite}
-        @keyframes spin{to{transform:rotate(360deg)}}
-        .toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;font-weight:500;z-index:1000;animation:fadeIn .3s}
-        @keyframes fadeIn{from{opacity:0;transform:translateX(-50%) translateY(-10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
-        .prize{animation:prize .5s ease-out}
-        @keyframes prize{0%{transform:scale(0.5);opacity:0}50%{transform:scale(1.1)}100%{transform:scale(1);opacity:1}}
-        .coupon{background:linear-gradient(135deg,#3b82f6,#1d4ed8);border-radius:8px;padding:12px;margin-bottom:8px}
+        :root {
+            --bg: #0a0a0f;
+            --card: #12121a;
+            --border: #1f1f2e;
+            --accent: #3b82f6;
+        }
+        body {
+            background: var(--bg);
+            color: #e0e0e0;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+        }
+        .input-field {
+            background: #0d0d12;
+            border: 1px solid var(--border);
+            color: #e0e0e0;
+            border-radius: 8px;
+            padding: 12px 16px;
+            width: 100%;
+            font-size: 14px;
+        }
+        .input-field:focus {
+            border-color: var(--accent);
+            outline: none;
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+            color: #fff;
+            padding: 14px;
+            border-radius: 8px;
+            font-weight: 600;
+            border: none;
+            cursor: pointer;
+            width: 100%;
+            font-size: 15px;
+        }
+        .btn-primary:hover {
+            opacity: 0.9;
+        }
+        .btn-primary:disabled {
+            background: #374151;
+            cursor: not-allowed;
+        }
+        .btn-claim {
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: #fff;
+            padding: 16px 40px;
+            border-radius: 12px;
+            font-weight: 700;
+            font-size: 18px;
+            border: none;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        .btn-claim:hover {
+            transform: scale(1.02);
+        }
+        .btn-claim:disabled {
+            background: #374151;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .loading-spinner {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .toast {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            border-radius: 8px;
+            color: #fff;
+            font-weight: 500;
+            z-index: 1000;
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateX(-50%) translateY(-10px); }
+            to { opacity: 1; transform: translateX(-50%) translateY(0); }
+        }
+        .prize-animation {
+            animation: prizePopup 0.4s ease-out;
+        }
+        @keyframes prizePopup {
+            0% { transform: scale(0.8); opacity: 0; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        .coupon-item {
+            background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+        }
     </style>
 </head>
 <body class="min-h-screen">
+    <!-- 导航 -->
     <nav class="bg-gradient-to-r from-blue-600 to-blue-800 py-4 px-6">
         <div class="max-w-4xl mx-auto flex justify-between items-center">
             <a href="/" class="flex items-center gap-2 text-white">
                 <span class="text-xl">🎫</span>
                 <span class="font-bold">{{SITE_NAME}} 兑换中心</span>
             </a>
-            <a href="{{NEW_API_URL}}" target="_blank" class="text-blue-200 hover:text-white text-sm">返回主站 →</a>
+            <div class="flex items-center gap-4">
+                <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-200 hover:text-white text-sm">钱包充值</a>
+                <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-200 hover:text-white text-sm">控制台 →</a>
+            </div>
         </div>
     </nav>
 
     <main class="max-w-md mx-auto px-4 py-8">
-        <!-- 登录区 -->
-        <div id="login-section" class="card p-8">
+        <!-- 登录区域 -->
+        <div id="section-login" class="card p-8">
             <div class="text-center mb-6">
                 <div class="text-5xl mb-4">🎁</div>
                 <h1 class="text-2xl font-bold">兑换券领取中心</h1>
@@ -491,173 +781,209 @@ CLAIM_PAGE = '''<!DOCTYPE html>
                 <div class="mt-4 inline-flex items-center bg-blue-900/30 text-blue-300 px-4 py-2 rounded-full border border-blue-800">
                     📦 当前可领: <span id="available-count" class="font-bold ml-1">{{AVAILABLE}}</span> 个
                 </div>
-                <p class="text-xs text-gray-500 mt-2">🎰 随机 $1~$100，大额低概率</p>
             </div>
+            
             <div class="space-y-4">
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">用户ID</label>
-                    <input type="number" id="user-id" class="input-dark" placeholder="在个人设置页面查看">
+                    <input type="number" id="input-userid" class="input-field" placeholder="在个人设置页面查看">
                 </div>
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">用户名</label>
-                    <input type="text" id="username" class="input-dark" placeholder="登录用户名">
+                    <input type="text" id="input-username" class="input-field" placeholder="登录用户名">
                 </div>
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">API Key</label>
-                    <input type="password" id="api-key" class="input-dark" placeholder="sk-xxx">
-                    <p class="text-xs text-gray-500 mt-1">在 <a href="{{NEW_API_URL}}/console/token" target="_blank" class="text-blue-400">令牌管理</a> 创建</p>
+                    <input type="password" id="input-apikey" class="input-field" placeholder="sk-xxx">
+                    <p class="text-xs text-gray-500 mt-1">
+                        在 <a href="{{NEW_API_URL}}/console/token" target="_blank" class="text-blue-400 hover:underline">令牌管理</a> 创建
+                    </p>
                 </div>
-                <button id="verify-btn" class="btn-primary">验证身份</button>
+                <button id="btn-verify" class="btn-primary">验证身份</button>
             </div>
         </div>
 
-        <!-- 领取区 -->
-        <div id="claim-section" class="hidden">
+        <!-- 领取区域 -->
+        <div id="section-claim" class="hidden">
+            <!-- 用户信息 -->
             <div class="card p-4 mb-4">
                 <div class="flex justify-between items-center">
                     <div>
                         <p class="text-gray-500 text-sm">当前用户</p>
-                        <p id="user-info" class="font-semibold"></p>
+                        <p id="display-userinfo" class="font-semibold"></p>
                     </div>
-                    <button id="logout-btn" class="text-blue-400 text-sm hover:underline">切换</button>
+                    <button id="btn-logout" class="text-blue-400 text-sm hover:underline">切换账号</button>
                 </div>
             </div>
 
+            <!-- 领取状态 -->
             <div class="card p-6 mb-4">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="font-semibold">领取状态</h2>
                     <span id="status-badge" class="px-3 py-1 rounded-full text-sm"></span>
                 </div>
-                <div id="quota-stats" class="flex flex-wrap gap-2 mb-4"></div>
+                
                 <div class="text-center py-4">
-                    <button id="claim-btn" class="btn-claim">🎰 抽取兑换券</button>
-                    <p id="cooldown-msg" class="text-gray-500 mt-3 text-sm"></p>
+                    <button id="btn-claim" class="btn-claim">🎰 抽取兑换券</button>
+                    <p id="cooldown-message" class="text-gray-500 mt-3 text-sm"></p>
                 </div>
+                
+                <!-- 中奖展示 -->
                 <div id="prize-display" class="hidden text-center py-4">
-                    <div class="prize">
-                        <div id="prize-amount" class="text-4xl font-bold text-green-400"></div>
-                        <div id="prize-code" class="font-mono text-lg mt-2 bg-gray-800 p-3 rounded-lg border border-gray-700"></div>
-                        <button id="copy-prize-btn" class="mt-2 text-blue-400 text-sm hover:underline">📋 复制兑换码</button>
+                    <div class="prize-animation">
+                        <div id="prize-title" class="text-3xl font-bold text-green-400 mb-2"></div>
+                        <div id="prize-code" class="font-mono text-lg bg-gray-800 p-3 rounded-lg border border-gray-700"></div>
+                        <button id="btn-copy-prize" class="mt-3 text-blue-400 text-sm hover:underline">📋 复制兑换码</button>
                     </div>
                 </div>
             </div>
 
+            <!-- 领取记录 -->
             <div class="card p-6">
                 <h2 class="font-semibold mb-3">📋 领取记录</h2>
-                <div id="history"></div>
+                <div id="history-list"></div>
             </div>
         </div>
     </main>
 
     <footer class="text-center py-6 text-gray-600 text-sm">
-        每 {{COOLDOWN}} 小时可领取一次 | <a href="/" class="text-blue-400">返回首页</a>
+        每 {{COOLDOWN}} 小时可领取一次 | 
+        <a href="/" class="text-blue-400 hover:underline">返回首页</a> | 
+        <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400 hover:underline">钱包充值</a>
     </footer>
 
     <script>
-        let userData = null;
-        
-        // 初始化
-        document.addEventListener('DOMContentLoaded', function() {
-            const saved = localStorage.getItem('coupon_user');
+        var userData = null;
+
+        // 页面加载
+        window.onload = function() {
+            // 尝试恢复用户数据
+            var saved = localStorage.getItem('coupon_user');
             if (saved) {
                 try {
                     userData = JSON.parse(saved);
-                    document.getElementById('user-id').value = userData.user_id || '';
-                    document.getElementById('username').value = userData.username || '';
-                    document.getElementById('api-key').value = userData.api_key || '';
-                } catch(e) {}
+                    document.getElementById('input-userid').value = userData.user_id || '';
+                    document.getElementById('input-username').value = userData.username || '';
+                    document.getElementById('input-apikey').value = userData.api_key || '';
+                } catch (e) {
+                    console.error('解析用户数据失败', e);
+                }
             }
-            
-            // 绑定事件
-            document.getElementById('verify-btn').addEventListener('click', verifyUser);
-            document.getElementById('logout-btn').addEventListener('click', logout);
-            document.getElementById('claim-btn').addEventListener('click', claimCoupon);
-            document.getElementById('copy-prize-btn').addEventListener('click', copyPrize);
-        });
 
-        function showToast(msg, ok) {
-            const t = document.createElement('div');
-            t.className = 'toast ' + (ok ? 'bg-green-600' : 'bg-red-600');
-            t.textContent = msg;
-            document.body.appendChild(t);
-            setTimeout(function() { t.remove(); }, 3000);
+            // 绑定事件
+            document.getElementById('btn-verify').addEventListener('click', handleVerify);
+            document.getElementById('btn-logout').addEventListener('click', handleLogout);
+            document.getElementById('btn-claim').addEventListener('click', handleClaim);
+            document.getElementById('btn-copy-prize').addEventListener('click', handleCopyPrize);
+        };
+
+        // 显示提示
+        function showToast(message, isSuccess) {
+            var toast = document.createElement('div');
+            toast.className = 'toast ' + (isSuccess ? 'bg-green-600' : 'bg-red-600');
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(function() {
+                toast.remove();
+            }, 3000);
         }
 
-        async function verifyUser() {
-            const userId = document.getElementById('user-id').value.trim();
-            const username = document.getElementById('username').value.trim();
-            const apiKey = document.getElementById('api-key').value.trim();
-            
+        // 验证身份
+        function handleVerify() {
+            var userId = document.getElementById('input-userid').value.trim();
+            var username = document.getElementById('input-username').value.trim();
+            var apiKey = document.getElementById('input-apikey').value.trim();
+
             if (!userId || !username || !apiKey) {
                 showToast('请填写完整信息', false);
                 return;
             }
 
-            const btn = document.getElementById('verify-btn');
+            var btn = document.getElementById('btn-verify');
             btn.disabled = true;
-            btn.innerHTML = '<span class="loading"></span> 验证中...';
+            btn.innerHTML = '<span class="loading-spinner"></span> 验证中...';
 
-            try {
-                const resp = await fetch('/api/verify', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({user_id: parseInt(userId), username: username, api_key: apiKey})
+            fetch('/api/verify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_id: parseInt(userId),
+                    username: username,
+                    api_key: apiKey
+                })
+            })
+            .then(function(response) {
+                return response.json().then(function(data) {
+                    return { ok: response.ok, data: data };
                 });
-                const data = await resp.json();
-                
-                if (resp.ok && data.success) {
-                    userData = {user_id: parseInt(userId), username: username, api_key: apiKey};
+            })
+            .then(function(result) {
+                if (result.ok && result.data.success) {
+                    userData = {
+                        user_id: parseInt(userId),
+                        username: username,
+                        api_key: apiKey
+                    };
                     localStorage.setItem('coupon_user', JSON.stringify(userData));
-                    showLoggedIn();
-                    loadStatus();
+                    showLoggedInUI();
+                    loadClaimStatus();
                     showToast('验证成功', true);
                 } else {
-                    showToast(data.detail || '验证失败', false);
+                    showToast(result.data.detail || '验证失败', false);
                 }
-            } catch (e) {
-                console.error(e);
+            })
+            .catch(function(error) {
+                console.error('验证请求失败', error);
                 showToast('网络错误，请重试', false);
-            }
-            
-            btn.disabled = false;
-            btn.textContent = '验证身份';
+            })
+            .finally(function() {
+                btn.disabled = false;
+                btn.textContent = '验证身份';
+            });
         }
 
-        function showLoggedIn() {
-            document.getElementById('login-section').classList.add('hidden');
-            document.getElementById('claim-section').classList.remove('hidden');
-            document.getElementById('user-info').textContent = userData.username + ' (ID:' + userData.user_id + ')';
+        // 显示已登录界面
+        function showLoggedInUI() {
+            document.getElementById('section-login').classList.add('hidden');
+            document.getElementById('section-claim').classList.remove('hidden');
+            document.getElementById('display-userinfo').textContent = userData.username + ' (ID:' + userData.user_id + ')';
         }
 
-        function logout() {
+        // 退出登录
+        function handleLogout() {
             localStorage.removeItem('coupon_user');
             userData = null;
-            document.getElementById('login-section').classList.remove('hidden');
-            document.getElementById('claim-section').classList.add('hidden');
+            document.getElementById('section-login').classList.remove('hidden');
+            document.getElementById('section-claim').classList.add('hidden');
         }
 
-        async function loadStatus() {
-            try {
-                const resp = await fetch('/api/claim/status', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(userData)
-                });
-                const data = await resp.json();
+        // 加载领取状态
+        function loadClaimStatus() {
+            fetch('/api/claim/status', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(userData)
+            })
+            .then(function(response) {
+                return response.json();
+            })
+            .then(function(data) {
                 if (data.success) {
-                    updateUI(data.data);
+                    updateClaimUI(data.data);
                 }
-            } catch(e) {
-                console.error(e);
-            }
+            })
+            .catch(function(error) {
+                console.error('加载状态失败', error);
+            });
         }
 
-        function updateUI(data) {
+        // 更新领取界面
+        function updateClaimUI(data) {
             document.getElementById('available-count').textContent = data.available_count;
-            
-            const btn = document.getElementById('claim-btn');
-            const badge = document.getElementById('status-badge');
-            const msg = document.getElementById('cooldown-msg');
+
+            var btn = document.getElementById('btn-claim');
+            var badge = document.getElementById('status-badge');
+            var msg = document.getElementById('cooldown-message');
 
             if (data.can_claim) {
                 btn.disabled = false;
@@ -671,78 +997,84 @@ CLAIM_PAGE = '''<!DOCTYPE html>
                 msg.textContent = data.cooldown_text || '';
             }
 
-            // 额度统计
-            const stats = document.getElementById('quota-stats');
-            let statsHtml = '';
-            for (const [k, v] of Object.entries(data.quota_stats || {})) {
-                statsHtml += '<span class="bg-blue-900/30 text-blue-300 px-2 py-1 rounded text-sm border border-blue-800">' + k + ': ' + v + '个</span>';
-            }
-            stats.innerHTML = statsHtml;
-
-            // 历史记录
-            const history = document.getElementById('history');
+            // 渲染历史记录
+            var historyList = document.getElementById('history-list');
             if (!data.history || data.history.length === 0) {
-                history.innerHTML = '<p class="text-gray-500 text-center text-sm">暂无记录</p>';
+                historyList.innerHTML = '<p class="text-gray-500 text-center text-sm">暂无领取记录</p>';
             } else {
-                let html = '';
-                for (const r of data.history) {
-                    html += '<div class="coupon text-white"><div class="flex justify-between"><span class="font-mono text-sm">' + r.coupon_code + '</span><span class="bg-white/20 px-2 rounded text-sm">$' + r.quota + '</span></div><div class="text-xs text-blue-200 mt-1">' + new Date(r.claim_time).toLocaleString('zh-CN') + '</div></div>';
+                var html = '';
+                for (var i = 0; i < data.history.length; i++) {
+                    var record = data.history[i];
+                    var date = new Date(record.claim_time).toLocaleString('zh-CN');
+                    html += '<div class="coupon-item text-white">';
+                    html += '<div class="flex justify-between items-center">';
+                    html += '<span class="font-mono text-sm">' + record.coupon_code + '</span>';
+                    html += '</div>';
+                    html += '<div class="text-xs text-blue-200 mt-1">' + date + '</div>';
+                    html += '</div>';
                 }
-                history.innerHTML = html;
+                historyList.innerHTML = html;
             }
         }
 
-        async function claimCoupon() {
-            const btn = document.getElementById('claim-btn');
+        // 领取兑换券
+        function handleClaim() {
+            var btn = document.getElementById('btn-claim');
             btn.disabled = true;
-            btn.innerHTML = '<span class="loading"></span> 抽取中...';
+            btn.innerHTML = '<span class="loading-spinner"></span> 抽取中...';
             document.getElementById('prize-display').classList.add('hidden');
 
-            try {
-                const resp = await fetch('/api/claim', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(userData)
+            fetch('/api/claim', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(userData)
+            })
+            .then(function(response) {
+                return response.json().then(function(data) {
+                    return { ok: response.ok, data: data };
                 });
-                const data = await resp.json();
-                
-                if (resp.ok && data.success) {
-                    document.getElementById('prize-amount').textContent = '🎉 $' + data.data.quota;
-                    document.getElementById('prize-code').textContent = data.data.coupon_code;
+            })
+            .then(function(result) {
+                if (result.ok && result.data.success) {
+                    var couponData = result.data.data;
+                    document.getElementById('prize-title').textContent = '🎉 恭喜获得额度!';
+                    document.getElementById('prize-code').textContent = couponData.coupon_code;
                     document.getElementById('prize-display').classList.remove('hidden');
-                    
-                    try {
-                        await navigator.clipboard.writeText(data.data.coupon_code);
-                        showToast('恭喜！兑换码已复制', true);
-                    } catch(e) {
-                        showToast('恭喜获得 $' + data.data.quota, true);
-                    }
-                } else {
-                    showToast(data.detail || '领取失败', false);
-                }
-            } catch (e) {
-                console.error(e);
-                showToast('网络错误', false);
-            }
 
-            btn.innerHTML = '🎰 抽取兑换券';
-            loadStatus();
+                    // 自动复制
+                    navigator.clipboard.writeText(couponData.coupon_code).then(function() {
+                        showToast('兑换码已复制到剪贴板', true);
+                    }).catch(function() {
+                        showToast('领取成功！请手动复制兑换码', true);
+                    });
+                } else {
+                    showToast(result.data.detail || '领取失败', false);
+                }
+            })
+            .catch(function(error) {
+                console.error('领取请求失败', error);
+                showToast('网络错误，请重试', false);
+            })
+            .finally(function() {
+                btn.innerHTML = '🎰 抽取兑换券';
+                loadClaimStatus();
+            });
         }
 
-        async function copyPrize() {
-            const code = document.getElementById('prize-code').textContent;
-            try {
-                await navigator.clipboard.writeText(code);
-                showToast('已复制', true);
-            } catch(e) {
-                showToast('复制失败', false);
-            }
+        // 复制兑换码
+        function handleCopyPrize() {
+            var code = document.getElementById('prize-code').textContent;
+            navigator.clipboard.writeText(code).then(function() {
+                showToast('已复制到剪贴板', true);
+            }).catch(function() {
+                showToast('复制失败，请手动复制', false);
+            });
         }
     </script>
 </body>
 </html>'''
 
-# ============ 管理后台 - 需要密码验证 ============
+# ============ 管理后台 HTML ============
 ADMIN_PAGE = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -751,101 +1083,205 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     <title>管理后台 - {{SITE_NAME}}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        :root{--bg:#0a0a0f;--card:#13131a;--border:#1e1e2a;--accent:#3b82f6}
-        body{background:var(--bg);color:#e0e0e0}
-        .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
-        .input-dark{background:#0d0d12;border:1px solid var(--border);color:#e0e0e0;border-radius:8px;padding:12px 16px;width:100%}
-        .input-dark:focus{border-color:var(--accent);outline:none}
-        .btn{padding:12px 24px;border-radius:8px;font-weight:600;border:none;cursor:pointer;width:100%}
-        .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
-        .btn-green{background:#10b981;color:#fff}.btn-green:hover{background:#059669}
-        .toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;z-index:1000}
+        :root {
+            --bg: #0a0a0f;
+            --card: #12121a;
+            --border: #1f1f2e;
+            --accent: #3b82f6;
+        }
+        body {
+            background: var(--bg);
+            color: #e0e0e0;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+        }
+        .input-field {
+            background: #0d0d12;
+            border: 1px solid var(--border);
+            color: #e0e0e0;
+            border-radius: 8px;
+            padding: 12px 16px;
+            width: 100%;
+        }
+        .input-field:focus {
+            border-color: var(--accent);
+            outline: none;
+        }
+        .btn {
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: 600;
+            border: none;
+            cursor: pointer;
+            width: 100%;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: #fff;
+        }
+        .btn-primary:hover {
+            background: #2563eb;
+        }
+        .btn-green {
+            background: #10b981;
+            color: #fff;
+        }
+        .btn-green:hover {
+            background: #059669;
+        }
+        .toast {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            border-radius: 8px;
+            color: #fff;
+            z-index: 1000;
+        }
+        #login-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.95);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+        .quota-btn {
+            transition: all 0.2s;
+        }
+        .quota-btn:hover {
+            opacity: 0.8;
+        }
+        .quota-btn.active {
+            ring: 2px;
+            ring-color: var(--accent);
+        }
     </style>
 </head>
 <body class="min-h-screen">
     <!-- 登录遮罩 -->
-    <div id="login-overlay" class="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
+    <div id="login-overlay">
         <div class="card p-8 w-full max-w-sm mx-4">
             <div class="text-center mb-6">
                 <div class="text-4xl mb-2">🔐</div>
                 <h1 class="text-xl font-bold">管理后台</h1>
                 <p class="text-gray-500 text-sm">请输入管理员密码</p>
             </div>
-            <input type="password" id="login-pwd" class="input-dark mb-4" placeholder="管理员密码" onkeypress="if(event.key==='Enter')adminLogin()">
-            <button onclick="adminLogin()" class="btn btn-primary">登录</button>
+            <input type="password" id="login-password" class="input-field mb-4" placeholder="管理员密码">
+            <button id="btn-login" class="btn btn-primary">登录</button>
             <a href="/" class="block text-center text-gray-500 text-sm mt-4 hover:text-blue-400">← 返回首页</a>
         </div>
     </div>
 
     <!-- 管理界面 -->
-    <div id="admin-content" class="hidden">
+    <div id="admin-main" class="hidden">
         <nav class="border-b border-gray-800 py-4 px-6">
             <div class="max-w-6xl mx-auto flex justify-between items-center">
-                <h1 class="font-bold text-xl flex items-center gap-2">🔧 管理后台</h1>
+                <h1 class="font-bold text-xl flex items-center gap-2">
+                    <span>🔧</span> 管理后台
+                </h1>
                 <div class="flex items-center gap-4">
                     <a href="/" class="text-gray-400 hover:text-white text-sm">← 返回首页</a>
-                    <button onclick="adminLogout()" class="text-red-400 hover:text-red-300 text-sm">退出登录</button>
+                    <button id="btn-logout" class="text-red-400 hover:text-red-300 text-sm">退出登录</button>
                 </div>
             </div>
         </nav>
 
         <main class="max-w-6xl mx-auto px-4 py-8">
             <div class="grid lg:grid-cols-3 gap-6">
+                <!-- 左侧：添加兑换码 -->
                 <div class="lg:col-span-2 space-y-6">
-                    <!-- 上传区 -->
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4">📤 添加兑换码</h2>
+                        <h2 class="font-semibold mb-4 flex items-center gap-2">
+                            <span>📤</span> 添加兑换码
+                        </h2>
+                        
+                        <!-- 额度选择 -->
                         <div class="grid grid-cols-5 gap-2 mb-4">
-                            <button onclick="setQuota(1)" class="quota-btn bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold hover:bg-green-900">$1</button>
-                            <button onclick="setQuota(5)" class="quota-btn bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold hover:bg-blue-900">$5</button>
-                            <button onclick="setQuota(10)" class="quota-btn bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold hover:bg-purple-900">$10</button>
-                            <button onclick="setQuota(50)" class="quota-btn bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold hover:bg-orange-900">$50</button>
-                            <button onclick="setQuota(100)" class="quota-btn bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold hover:bg-red-900">$100</button>
+                            <button onclick="selectQuota(1)" class="quota-btn bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold">$1</button>
+                            <button onclick="selectQuota(5)" class="quota-btn bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold">$5</button>
+                            <button onclick="selectQuota(10)" class="quota-btn bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold">$10</button>
+                            <button onclick="selectQuota(50)" class="quota-btn bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold">$50</button>
+                            <button onclick="selectQuota(100)" class="quota-btn bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold">$100</button>
                         </div>
+                        
                         <div class="flex items-center gap-2 mb-4">
                             <span class="text-gray-400">当前额度:</span>
-                            <input type="number" id="quota-input" value="1" class="w-20 input-dark text-center font-bold">
+                            <input type="number" id="quota-input" value="1" class="w-20 input-field text-center font-bold">
                             <span class="text-gray-400">美元</span>
                         </div>
+                        
+                        <!-- 文件上传 -->
                         <div class="mb-4">
-                            <label class="block text-sm text-gray-400 mb-2">上传TXT文件</label>
-                            <input type="file" id="txt-file" accept=".txt" class="input-dark">
+                            <label class="block text-sm text-gray-400 mb-2">上传TXT文件（每行一个兑换码）</label>
+                            <input type="file" id="file-input" accept=".txt" class="input-field">
                         </div>
-                        <button onclick="uploadTxt()" class="btn btn-primary mb-4">上传文件</button>
+                        <button id="btn-upload" class="btn btn-primary mb-4">上传文件</button>
+                        
                         <hr class="border-gray-700 my-4">
+                        
+                        <!-- 手动输入 -->
                         <div>
                             <label class="block text-sm text-gray-400 mb-2">或手动粘贴（每行一个）</label>
-                            <textarea id="coupons-input" rows="4" class="input-dark font-mono text-sm" placeholder="粘贴兑换码..."></textarea>
+                            <textarea id="codes-input" rows="4" class="input-field font-mono text-sm" placeholder="粘贴兑换码，每行一个..."></textarea>
                         </div>
-                        <button onclick="addCoupons()" class="btn btn-green mt-3">添加兑换码</button>
+                        <button id="btn-add" class="btn btn-green mt-3">添加兑换码</button>
                     </div>
 
                     <!-- 概率说明 -->
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4">🎰 概率说明</h2>
+                        <h2 class="font-semibold mb-4 flex items-center gap-2">
+                            <span>🎰</span> 概率说明
+                        </h2>
                         <div class="grid grid-cols-5 gap-2 text-center text-sm">
-                            <div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-green-400 font-bold">$1</div><div class="text-gray-500">50%</div></div>
-                            <div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-blue-400 font-bold">$5</div><div class="text-gray-500">30%</div></div>
-                            <div class="bg-purple-900/30 p-3 rounded border border-purple-800"><div class="text-purple-400 font-bold">$10</div><div class="text-gray-500">15%</div></div>
-                            <div class="bg-orange-900/30 p-3 rounded border border-orange-800"><div class="text-orange-400 font-bold">$50</div><div class="text-gray-500">4%</div></div>
-                            <div class="bg-red-900/30 p-3 rounded border border-red-800"><div class="text-red-400 font-bold">$100</div><div class="text-gray-500">1%</div></div>
+                            <div class="bg-green-900/30 p-3 rounded border border-green-800">
+                                <div class="text-green-400 font-bold">$1</div>
+                                <div class="text-gray-500">50%</div>
+                            </div>
+                            <div class="bg-blue-900/30 p-3 rounded border border-blue-800">
+                                <div class="text-blue-400 font-bold">$5</div>
+                                <div class="text-gray-500">30%</div>
+                            </div>
+                            <div class="bg-purple-900/30 p-3 rounded border border-purple-800">
+                                <div class="text-purple-400 font-bold">$10</div>
+                                <div class="text-gray-500">15%</div>
+                            </div>
+                            <div class="bg-orange-900/30 p-3 rounded border border-orange-800">
+                                <div class="text-orange-400 font-bold">$50</div>
+                                <div class="text-gray-500">4%</div>
+                            </div>
+                            <div class="bg-red-900/30 p-3 rounded border border-red-800">
+                                <div class="text-red-400 font-bold">$100</div>
+                                <div class="text-gray-500">1%</div>
+                            </div>
                         </div>
+                        <p class="text-gray-500 text-xs mt-3 text-center">用户抽取时按此概率随机分配</p>
                     </div>
                 </div>
 
+                <!-- 右侧：统计信息 -->
                 <div class="space-y-6">
-                    <!-- 统计 -->
                     <div class="card p-6">
                         <div class="flex justify-between items-center mb-4">
-                            <h2 class="font-semibold">📊 统计</h2>
-                            <button onclick="loadStats()" class="text-blue-400 text-sm hover:underline">刷新</button>
+                            <h2 class="font-semibold flex items-center gap-2">
+                                <span>📊</span> 统计数据
+                            </h2>
+                            <button id="btn-refresh" class="text-blue-400 hover:text-blue-300 text-sm">刷新</button>
                         </div>
-                        <div id="stats">加载中...</div>
+                        <div id="stats-container">加载中...</div>
                     </div>
 
-                    <!-- 最近领取 -->
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4">📋 最近领取</h2>
+                        <h2 class="font-semibold mb-4 flex items-center gap-2">
+                            <span>📋</span> 最近领取
+                        </h2>
                         <div id="recent-claims" class="max-h-80 overflow-y-auto space-y-2 text-sm"></div>
                     </div>
                 </div>
@@ -856,158 +1292,303 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     <div id="toast" class="toast hidden"></div>
 
     <script>
-        let adminPwd = '';
+        var adminPassword = '';
 
-        document.addEventListener('DOMContentLoaded', function() {
-            const saved = sessionStorage.getItem('admin_pwd');
-            if (saved) {
-                adminPwd = saved;
-                checkLogin();
+        // 页面加载
+        window.onload = function() {
+            // 检查是否已登录
+            var savedPwd = sessionStorage.getItem('admin_password');
+            if (savedPwd) {
+                adminPassword = savedPwd;
+                checkPassword();
             }
-        });
 
-        function showToast(msg, ok) {
-            const t = document.getElementById('toast');
-            t.textContent = msg;
-            t.className = 'toast ' + (ok ? 'bg-green-600' : 'bg-red-600');
-            setTimeout(function() { t.classList.add('hidden'); }, 3000);
+            // 绑定事件
+            document.getElementById('btn-login').addEventListener('click', handleLogin);
+            document.getElementById('login-password').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') handleLogin();
+            });
+            document.getElementById('btn-logout').addEventListener('click', handleLogout);
+            document.getElementById('btn-upload').addEventListener('click', handleUpload);
+            document.getElementById('btn-add').addEventListener('click', handleAdd);
+            document.getElementById('btn-refresh').addEventListener('click', loadStats);
+        };
+
+        // 显示提示
+        function showToast(message, isSuccess) {
+            var toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = 'toast ' + (isSuccess ? 'bg-green-600' : 'bg-red-600');
+            setTimeout(function() {
+                toast.classList.add('hidden');
+            }, 3000);
         }
 
-        async function adminLogin() {
-            const pwd = document.getElementById('login-pwd').value;
-            if (!pwd) { showToast('请输入密码', false); return; }
+        // 登录
+        function handleLogin() {
+            var password = document.getElementById('login-password').value;
+            if (!password) {
+                showToast('请输入密码', false);
+                return;
+            }
 
-            try {
-                const resp = await fetch('/api/admin/login', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({password: pwd})
-                });
-                if (resp.ok) {
-                    adminPwd = pwd;
-                    sessionStorage.setItem('admin_pwd', pwd);
-                    document.getElementById('login-overlay').classList.add('hidden');
-                    document.getElementById('admin-content').classList.remove('hidden');
+            fetch('/api/admin/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: password })
+            })
+            .then(function(response) {
+                if (response.ok) {
+                    adminPassword = password;
+                    sessionStorage.setItem('admin_password', password);
+                    showAdminUI();
                     loadStats();
                 } else {
                     showToast('密码错误', false);
                 }
-            } catch(e) {
+            })
+            .catch(function(error) {
+                console.error('登录失败', error);
                 showToast('网络错误', false);
-            }
+            });
         }
 
-        async function checkLogin() {
-            try {
-                const resp = await fetch('/api/admin/stats?password=' + encodeURIComponent(adminPwd));
-                if (resp.ok) {
-                    document.getElementById('login-overlay').classList.add('hidden');
-                    document.getElementById('admin-content').classList.remove('hidden');
+        // 检查密码
+        function checkPassword() {
+            fetch('/api/admin/stats?password=' + encodeURIComponent(adminPassword))
+            .then(function(response) {
+                if (response.ok) {
+                    showAdminUI();
                     loadStats();
                 } else {
-                    sessionStorage.removeItem('admin_pwd');
-                    adminPwd = '';
+                    sessionStorage.removeItem('admin_password');
+                    adminPassword = '';
                 }
-            } catch(e) {}
+            })
+            .catch(function(error) {
+                console.error('验证失败', error);
+            });
         }
 
-        function adminLogout() {
-            sessionStorage.removeItem('admin_pwd');
-            adminPwd = '';
+        // 显示管理界面
+        function showAdminUI() {
+            document.getElementById('login-overlay').classList.add('hidden');
+            document.getElementById('admin-main').classList.remove('hidden');
+        }
+
+        // 退出登录
+        function handleLogout() {
+            sessionStorage.removeItem('admin_password');
+            adminPassword = '';
             location.reload();
         }
 
-        function setQuota(q) {
-            document.getElementById('quota-input').value = q;
-            document.querySelectorAll('.quota-btn').forEach(function(b) { b.classList.remove('ring-2', 'ring-blue-500'); });
+        // 选择额度
+        function selectQuota(quota) {
+            document.getElementById('quota-input').value = quota;
+            // 更新按钮样式
+            document.querySelectorAll('.quota-btn').forEach(function(btn) {
+                btn.classList.remove('ring-2', 'ring-blue-500');
+            });
             event.target.classList.add('ring-2', 'ring-blue-500');
         }
 
-        async function uploadTxt() {
-            const quota = document.getElementById('quota-input').value;
-            const file = document.getElementById('txt-file').files[0];
-            if (!file) { showToast('请选择文件', false); return; }
+        // 上传文件
+        function handleUpload() {
+            var quota = document.getElementById('quota-input').value;
+            var fileInput = document.getElementById('file-input');
+            var file = fileInput.files[0];
 
-            const formData = new FormData();
-            formData.append('password', adminPwd);
+            if (!file) {
+                showToast('请选择文件', false);
+                return;
+            }
+
+            var formData = new FormData();
+            formData.append('password', adminPassword);
             formData.append('quota', quota);
             formData.append('file', file);
 
-            try {
-                const resp = await fetch('/api/admin/upload-txt', { method: 'POST', body: formData });
-                const data = await resp.json();
-                showToast(data.message || data.detail, resp.ok);
-                if (resp.ok) { loadStats(); document.getElementById('txt-file').value = ''; }
-            } catch(e) { showToast('上传失败', false); }
-        }
-
-        async function addCoupons() {
-            const quota = parseFloat(document.getElementById('quota-input').value);
-            const text = document.getElementById('coupons-input').value;
-            const coupons = text.split('\n').filter(function(s) { return s.trim(); });
-
-            if (!coupons.length) { showToast('请输入兑换码', false); return; }
-
-            try {
-                const resp = await fetch('/api/admin/add-coupons', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({password: adminPwd, quota: quota, coupons: coupons})
-                });
-                const data = await resp.json();
-                showToast(data.message || data.detail, resp.ok);
-                if (resp.ok) { loadStats(); document.getElementById('coupons-input').value = ''; }
-            } catch(e) { showToast('添加失败', false); }
-        }
-
-        async function loadStats() {
-            try {
-                const resp = await fetch('/api/admin/stats?password=' + encodeURIComponent(adminPwd));
-                const data = await resp.json();
-                
-                if (resp.ok && data.success) {
-                    const d = data.data;
-                    let html = '<div class="grid grid-cols-3 gap-2 text-center mb-4">' +
-                        '<div class="bg-gray-800 p-3 rounded"><div class="text-xl font-bold">' + d.total + '</div><div class="text-xs text-gray-500">总数</div></div>' +
-                        '<div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-xl font-bold text-green-400">' + d.available + '</div><div class="text-xs text-gray-500">可用</div></div>' +
-                        '<div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-xl font-bold text-blue-400">' + d.claimed + '</div><div class="text-xs text-gray-500">已领</div></div>' +
-                        '</div><div class="space-y-1">';
-                    
-                    for (const [k, v] of Object.entries(d.quota_stats || {})) {
-                        html += '<div class="flex justify-between text-sm bg-gray-800/50 p-2 rounded"><span>' + k + '</span><span class="text-green-400">' + v.available + '</span><span class="text-gray-500">' + v.claimed + '</span></div>';
-                    }
-                    html += '</div>';
-                    document.getElementById('stats').innerHTML = html;
-
-                    let claimsHtml = '';
-                    for (const r of d.recent_claims) {
-                        claimsHtml += '<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:' + r.user_id + '</span> ' + r.username + ' <span class="text-green-400">$' + r.quota + '</span> <span class="text-gray-600">' + r.time + '</span></div>';
-                    }
-                    document.getElementById('recent-claims').innerHTML = claimsHtml || '<p class="text-gray-600">暂无</p>';
+            fetch('/api/admin/upload-txt', {
+                method: 'POST',
+                body: formData
+            })
+            .then(function(response) {
+                return response.json();
+            })
+            .then(function(data) {
+                showToast(data.message || data.detail, !!data.success);
+                if (data.success) {
+                    loadStats();
+                    fileInput.value = '';
                 }
-            } catch(e) { console.error(e); }
+            })
+            .catch(function(error) {
+                console.error('上传失败', error);
+                showToast('上传失败', false);
+            });
+        }
+
+        // 手动添加
+        function handleAdd() {
+            var quota = parseFloat(document.getElementById('quota-input').value);
+            var text = document.getElementById('codes-input').value;
+            var codes = text.split('\n').filter(function(s) { return s.trim(); });
+
+            if (codes.length === 0) {
+                showToast('请输入兑换码', false);
+                return;
+            }
+
+            fetch('/api/admin/add-coupons', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    password: adminPassword,
+                    quota: quota,
+                    coupons: codes
+                })
+            })
+            .then(function(response) {
+                return response.json();
+            })
+            .then(function(data) {
+                showToast(data.message || data.detail, !!data.success);
+                if (data.success) {
+                    loadStats();
+                    document.getElementById('codes-input').value = '';
+                }
+            })
+            .catch(function(error) {
+                console.error('添加失败', error);
+                showToast('添加失败', false);
+            });
+        }
+
+        // 加载统计
+        function loadStats() {
+            fetch('/api/admin/stats?password=' + encodeURIComponent(adminPassword))
+            .then(function(response) {
+                return response.json();
+            })
+            .then(function(result) {
+                if (result.success) {
+                    var data = result.data;
+                    
+                    // 统计数据
+                    var statsHtml = '<div class="grid grid-cols-3 gap-2 text-center mb-4">';
+                    statsHtml += '<div class="bg-gray-800 p-3 rounded"><div class="text-xl font-bold">' + data.total + '</div><div class="text-xs text-gray-500">总数</div></div>';
+                    statsHtml += '<div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-xl font-bold text-green-400">' + data.available + '</div><div class="text-xs text-gray-500">可用</div></div>';
+                    statsHtml += '<div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-xl font-bold text-blue-400">' + data.claimed + '</div><div class="text-xs text-gray-500">已领</div></div>';
+                    statsHtml += '</div>';
+                    
+                    statsHtml += '<div class="space-y-1">';
+                    for (var key in data.quota_stats) {
+                        var stat = data.quota_stats[key];
+                        statsHtml += '<div class="flex justify-between text-sm bg-gray-800/50 p-2 rounded">';
+                        statsHtml += '<span>' + key + '</span>';
+                        statsHtml += '<span class="text-green-400">' + stat.available + ' 可用</span>';
+                        statsHtml += '<span class="text-gray-500">' + stat.claimed + ' 已领</span>';
+                        statsHtml += '</div>';
+                    }
+                    statsHtml += '</div>';
+                    
+                    document.getElementById('stats-container').innerHTML = statsHtml;
+
+                    // 最近领取
+                    var recentHtml = '';
+                    for (var i = 0; i < data.recent_claims.length; i++) {
+                        var claim = data.recent_claims[i];
+                        recentHtml += '<div class="bg-gray-800/50 p-2 rounded text-gray-400">';
+                        recentHtml += '<span class="text-blue-400">ID:' + claim.user_id + '</span> ';
+                        recentHtml += claim.username + ' ';
+                        recentHtml += '<span class="text-green-400">$' + claim.quota + '</span> ';
+                        recentHtml += '<span class="text-gray-600">' + claim.time + '</span>';
+                        recentHtml += '</div>';
+                    }
+                    document.getElementById('recent-claims').innerHTML = recentHtml || '<p class="text-gray-600 text-center">暂无记录</p>';
+                }
+            })
+            .catch(function(error) {
+                console.error('加载统计失败', error);
+            });
         }
     </script>
 </body>
 </html>'''
 
-# ============ Widget ============
+# ============ Widget HTML ============
 WIDGET_PAGE = '''<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:transparent;font-family:system-ui,sans-serif}
-.w{background:linear-gradient(135deg,#1e3a5f,#0f172a);border:1px solid #334155;border-radius:12px;padding:16px;color:#fff;max-width:280px}
-.h{display:flex;align-items:center;gap:8px;margin-bottom:12px}
-.i{font-size:24px}.t{font-weight:600;font-size:14px}
-.s{display:flex;justify-content:space-between;margin-bottom:12px;font-size:12px;color:#94a3b8}
-.c{color:#60a5fa;font-weight:700;font-size:18px}
-.b{display:block;width:100%;background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;text-align:center;padding:10px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px}
-.b:hover{background:linear-gradient(135deg,#2563eb,#1e40af)}
-</style></head><body>
-<div class="w"><div class="h"><span class="i">🎫</span><span class="t">兑换券领取中心</span></div>
-<div class="s"><span>当前可领</span><span class="c">{{AVAILABLE}} 个</span></div>
-<a href="{{COUPON_SITE_URL}}/claim" target="_blank" class="b">🎁 免费领取 →</a></div>
-</body></html>'''
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: transparent; font-family: system-ui, -apple-system, sans-serif; }
+        .widget {
+            background: linear-gradient(135deg, #1e3a5f 0%, #0f172a 100%);
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 16px;
+            color: #fff;
+            max-width: 280px;
+        }
+        .widget-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .widget-icon { font-size: 24px; }
+        .widget-title { font-weight: 600; font-size: 14px; }
+        .widget-stats {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 12px;
+            font-size: 12px;
+            color: #94a3b8;
+        }
+        .widget-count {
+            color: #60a5fa;
+            font-weight: 700;
+            font-size: 18px;
+        }
+        .widget-btn {
+            display: block;
+            width: 100%;
+            background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+            color: #fff;
+            text-align: center;
+            padding: 10px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .widget-btn:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+    </style>
+</head>
+<body>
+    <div class="widget">
+        <div class="widget-header">
+            <span class="widget-icon">🎫</span>
+            <span class="widget-title">兑换券领取</span>
+        </div>
+        <div class="widget-stats">
+            <span>当前可领</span>
+            <span class="widget-count">{{AVAILABLE}} 个</span>
+        </div>
+        <a href="{{COUPON_SITE_URL}}/claim" target="_blank" class="widget-btn">
+            🎁 免费领取 →
+        </a>
+    </div>
+</body>
+</html>'''
 
 if __name__ == "__main__":
     import uvicorn
