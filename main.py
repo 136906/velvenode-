@@ -797,7 +797,7 @@ resp = client.chat.completions.create(
                 </div>
                 <div class="card p-6">
                     <h3 class="font-semibold mb-3 text-yellow-400">⚠️ 注意事项</h3>
-                    <ul class="text-gray-400 text-sm space-y-1"><li>• 请勿分享API Key</li><li>• 违规将被封禁</li><li>• 额度用完需充值</li></ul>
+                    <ul class="text-gray-400 text-sm space-y-1"><li>• 请勿分享API Key</li><li>• 违规将被封禁</li><li>• 额度用完使用兑换码</li></ul>
                 </div>
             </div>
         </div>
@@ -1647,3 +1647,4 @@ WIDGET_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
