@@ -174,24 +174,41 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 # ============ 用户验证函数 ============
 async def verify_user_identity(user_id: int, username: str, api_key: str) -> bool:
+    """验证用户身份 - 必须是有效的 API Key"""
+    
+    # 1. 基本格式检查
+    if not api_key or not api_key.startswith('sk-') or len(api_key) < 20:
+        return False
+    
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{NEW_API_URL}/v1/models",
                 headers={"Authorization": f"Bearer {api_key}"}
             )
-            if response.status_code == 200:
-                return True
             
-            response2 = await client.get(
-                f"{NEW_API_URL}/api/user/self",
-                headers={"Authorization": f"Bearer {api_key}"}
-            )
-            if response2.status_code == 200:
-                return True
-            
-            return False
-    except:
+            # 不管状态码，检查返回内容
+            try:
+                data = response.json()
+                
+                # 如果返回包含 error 字段，说明验证失败
+                if isinstance(data, dict) and 'error' in data:
+                    return False
+                
+                # 如果返回包含 data 字段且是列表，说明验证成功
+                if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list):
+                    return True
+                
+                # 有些 API 直接返回模型列表
+                if isinstance(data, list) and len(data) > 0:
+                    return True
+                
+                return False
+            except:
+                return False
+                
+    except Exception as e:
+        print(f"验证失败: {e}")
         return False
 
 def get_random_coupon(db: Session):
