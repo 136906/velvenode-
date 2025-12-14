@@ -1,22 +1,24 @@
 from fastapi import FastAPI, HTTPException, Request, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Float
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Float, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime, timedelta, timezone
 import httpx
 import random
 import os
+import json
 
 # ============ 配置 ============
 NEW_API_URL = os.getenv("NEW_API_URL", "https://velvenode.zeabur.app")
 COUPON_SITE_URL = os.getenv("COUPON_SITE_URL", "https://velvenodehome.zeabur.app")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./coupon.db")
-CLAIM_COOLDOWN_HOURS = int(os.getenv("CLAIM_COOLDOWN_HOURS", "8"))
 SITE_NAME = os.getenv("SITE_NAME", "velvenode")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
-QUOTA_WEIGHTS = {1: 50, 5: 30, 10: 15, 50: 4, 100: 1}
+# 默认配置（会被数据库配置覆盖）
+DEFAULT_COOLDOWN_HOURS = 8
+DEFAULT_QUOTA_WEIGHTS = {1: 50, 5: 30, 10: 15, 50: 4, 100: 1}
 
 # ============ 数据库 ============
 Base = declarative_base()
@@ -41,6 +43,13 @@ class ClaimRecord(Base):
     quota_dollars = Column(Float, default=1.0)
     claim_time = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+class SystemConfig(Base):
+    __tablename__ = "system_config"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    config_key = Column(String(64), unique=True, nullable=False)
+    config_value = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base.metadata.create_all(bind=engine)
@@ -52,16 +61,114 @@ def get_db():
     finally:
         db.close()
 
+# ============ 配置管理函数 ============
+def get_config(db: Session, key: str, default=None):
+    """获取配置值"""
+    config = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
+    if config:
+        return config.config_value
+    return default
+
+def set_config(db: Session, key: str, value: str):
+    """设置配置值"""
+    config = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
+    if config:
+        config.config_value = value
+        config.updated_at = datetime.now(timezone.utc)
+    else:
+        config = SystemConfig(config_key=key, config_value=value)
+        db.add(config)
+    db.commit()
+
+def get_cooldown_hours(db: Session) -> int:
+    """获取冷却时间（小时）"""
+    val = get_config(db, "cooldown_hours")
+    if val:
+        try:
+            return int(val)
+        except:
+            pass
+    return DEFAULT_COOLDOWN_HOURS
+
+def get_quota_weights(db: Session) -> dict:
+    """获取概率权重配置"""
+    val = get_config(db, "quota_weights")
+    if val:
+        try:
+            return json.loads(val)
+        except:
+            pass
+    return DEFAULT_QUOTA_WEIGHTS.copy()
+
+def init_default_config(db: Session):
+    """初始化默认配置"""
+    if not get_config(db, "cooldown_hours"):
+        set_config(db, "cooldown_hours", str(DEFAULT_COOLDOWN_HOURS))
+    if not get_config(db, "quota_weights"):
+        set_config(db, "quota_weights", json.dumps(DEFAULT_QUOTA_WEIGHTS))
+
+# 初始化默认配置
+with SessionLocal() as db:
+    init_default_config(db)
+
 app = FastAPI(title="兑换券系统")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def now_utc():
     return datetime.now(timezone.utc)
 
+# ============ 用户验证函数 ============
+async def verify_user_identity(user_id: int, username: str, api_key: str) -> bool:
+    """
+    验证用户身份：通过调用主站 API 验证 API Key 是否有效
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # 尝试调用主站的 /v1/models 接口验证 API Key
+            response = await client.get(
+                f"{NEW_API_URL}/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"}
+            )
+            
+            if response.status_code == 200:
+                return True
+            
+            # 如果 /v1/models 不行，尝试其他验证方式
+            # 比如调用用户信息接口
+            response2 = await client.get(
+                f"{NEW_API_URL}/api/user/self",
+                headers={"Authorization": f"Bearer {api_key}"}
+            )
+            
+            if response2.status_code == 200:
+                try:
+                    data = response2.json()
+                    # 验证用户ID和用户名是否匹配
+                    if data.get("data", {}).get("id") == user_id or data.get("id") == user_id:
+                        return True
+                    if data.get("data", {}).get("username") == username or data.get("username") == username:
+                        return True
+                except:
+                    pass
+                return True
+            
+            return False
+    except httpx.TimeoutException:
+        # 超时时，为了用户体验，可以选择放行或拒绝
+        # 这里选择拒绝，更安全
+        return False
+    except Exception as e:
+        print(f"验证用户身份时出错: {e}")
+        return False
+
 def get_random_coupon(db: Session):
+    """根据概率权重随机选择一个兑换码"""
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).all()
     if not available:
         return None
+    
+    # 获取当前概率配置
+    quota_weights = get_quota_weights(db)
     
     by_quota = {}
     for c in available:
@@ -72,12 +179,20 @@ def get_random_coupon(db: Session):
     
     choices, weights = [], []
     for quota, coupons in by_quota.items():
-        # 预设概率
-        if quota in QUOTA_WEIGHTS:
-            weight = QUOTA_WEIGHTS[quota]
+        # 查找配置的概率
+        quota_str = str(quota)
+        quota_int = int(quota) if quota == int(quota) else quota
+        
+        if quota_str in quota_weights:
+            weight = quota_weights[quota_str]
+        elif str(quota_int) in quota_weights:
+            weight = quota_weights[str(quota_int)]
+        elif quota in quota_weights:
+            weight = quota_weights[quota]
+        elif quota_int in quota_weights:
+            weight = quota_weights[quota_int]
         else:
             # 自定义额度：额度越大概率越低
-            # 公式：weight = max(1, 100 / quota)
             weight = max(1, int(100 / quota))
         
         choices.append((quota, coupons))
@@ -105,7 +220,7 @@ async def verify_user(request: Request):
         raise HTTPException(status_code=400, detail="用户ID必须是数字")
     
     if not await verify_user_identity(user_id, username, api_key):
-        raise HTTPException(status_code=401, detail="API Key 无效或已过期")
+        raise HTTPException(status_code=401, detail="API Key 无效或已过期，请检查后重试")
     
     return {"success": True, "data": {"user_id": user_id, "username": username}}
 
@@ -126,6 +241,7 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
     if not await verify_user_identity(user_id, username, api_key):
         raise HTTPException(status_code=401, detail="API Key 无效")
     
+    cooldown_hours = get_cooldown_hours(db)
     now = now_utc()
     last_claim = db.query(ClaimRecord).filter(ClaimRecord.user_id == user_id).order_by(ClaimRecord.claim_time.desc()).first()
     
@@ -134,7 +250,7 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
     
     if last_claim:
         last_time = last_claim.claim_time.replace(tzinfo=timezone.utc) if last_claim.claim_time.tzinfo is None else last_claim.claim_time
-        next_claim_time = last_time + timedelta(hours=CLAIM_COOLDOWN_HOURS)
+        next_claim_time = last_time + timedelta(hours=cooldown_hours)
         if now < next_claim_time:
             can_claim = False
             remaining = next_claim_time - now
@@ -184,12 +300,13 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     if not await verify_user_identity(user_id, username, api_key):
         raise HTTPException(status_code=401, detail="API Key 无效")
     
+    cooldown_hours = get_cooldown_hours(db)
     now = now_utc()
     last_claim = db.query(ClaimRecord).filter(ClaimRecord.user_id == user_id).order_by(ClaimRecord.claim_time.desc()).first()
     
     if last_claim:
         last_time = last_claim.claim_time.replace(tzinfo=timezone.utc) if last_claim.claim_time.tzinfo is None else last_claim.claim_time
-        next_claim_time = last_time + timedelta(hours=CLAIM_COOLDOWN_HOURS)
+        next_claim_time = last_time + timedelta(hours=cooldown_hours)
         if now < next_claim_time:
             remaining = next_claim_time - now
             h = int(remaining.total_seconds()) // 3600
@@ -290,6 +407,10 @@ async def get_stats(password: str, db: Session = Depends(get_db)):
     
     recent = db.query(ClaimRecord).order_by(ClaimRecord.claim_time.desc()).limit(50).all()
     
+    # 获取当前配置
+    cooldown_hours = get_cooldown_hours(db)
+    quota_weights = get_quota_weights(db)
+    
     return {
         "success": True,
         "data": {
@@ -297,6 +418,8 @@ async def get_stats(password: str, db: Session = Depends(get_db)):
             "available": available,
             "claimed": claimed,
             "quota_stats": quota_stats,
+            "cooldown_hours": cooldown_hours,
+            "quota_weights": quota_weights,
             "recent_claims": [
                 {
                     "user_id": r.user_id,
@@ -309,31 +432,66 @@ async def get_stats(password: str, db: Session = Depends(get_db)):
         }
     }
 
+@app.post("/api/admin/update-config")
+async def update_config(request: Request, db: Session = Depends(get_db)):
+    """更新系统配置"""
+    body = await request.json()
+    password = body.get("password", "")
+    
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="密码错误")
+    
+    # 更新冷却时间
+    if "cooldown_hours" in body:
+        try:
+            hours = int(body["cooldown_hours"])
+            if hours < 1:
+                raise HTTPException(status_code=400, detail="冷却时间至少为1小时")
+            set_config(db, "cooldown_hours", str(hours))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="冷却时间必须是整数")
+    
+    # 更新概率权重
+    if "quota_weights" in body:
+        weights = body["quota_weights"]
+        if not isinstance(weights, dict):
+            raise HTTPException(status_code=400, detail="概率配置格式错误")
+        # 验证权重值
+        for k, v in weights.items():
+            if not isinstance(v, (int, float)) or v < 0:
+                raise HTTPException(status_code=400, detail=f"概率权重必须是非负数: {k}={v}")
+        set_config(db, "quota_weights", json.dumps(weights))
+    
+    return {"success": True, "message": "配置已更新"}
+
 @app.get("/api/stats/public")
 async def get_public_stats(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
-    return {"available": available, "cooldown_hours": CLAIM_COOLDOWN_HOURS}
+    cooldown_hours = get_cooldown_hours(db)
+    return {"available": available, "cooldown_hours": cooldown_hours}
 
 # ============ 页面路由 ============
 @app.get("/", response_class=HTMLResponse)
 async def index(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
+    cooldown_hours = get_cooldown_hours(db)
     html = HOME_PAGE
     html = html.replace("{{AVAILABLE}}", str(available))
     html = html.replace("{{SITE_NAME}}", SITE_NAME)
     html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
-    html = html.replace("{{COOLDOWN}}", str(CLAIM_COOLDOWN_HOURS))
+    html = html.replace("{{COOLDOWN}}", str(cooldown_hours))
     html = html.replace("{{COUPON_SITE_URL}}", COUPON_SITE_URL)
     return html
 
 @app.get("/claim", response_class=HTMLResponse)
 async def claim_page(db: Session = Depends(get_db)):
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
+    cooldown_hours = get_cooldown_hours(db)
     html = CLAIM_PAGE
     html = html.replace("{{AVAILABLE}}", str(available))
     html = html.replace("{{SITE_NAME}}", SITE_NAME)
     html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
-    html = html.replace("{{COOLDOWN}}", str(CLAIM_COOLDOWN_HOURS))
+    html = html.replace("{{COOLDOWN}}", str(cooldown_hours))
     return html
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -363,6 +521,7 @@ HOME_PAGE = '''<!DOCTYPE html>
         .btn{padding:10px 20px;border-radius:8px;font-weight:500;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border:none}
         .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
         .btn-secondary{background:#1f1f2e;color:#e0e0e0;border:1px solid #2a2a3a}.btn-secondary:hover{background:#2a2a3a}
+        .btn-console{background:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#fff}.btn-console:hover{opacity:0.9}
         .code-box{background:#0d0d12;border:1px solid var(--border);border-radius:8px;padding:14px 18px;font-family:ui-monospace,monospace}
         .glow{box-shadow:0 0 40px rgba(59,130,246,0.15)}
         .endpoint-container{height:24px;overflow:hidden;display:inline-block}
@@ -398,6 +557,7 @@ HOME_PAGE = '''<!DOCTYPE html>
             
             <div class="flex justify-center gap-4 flex-wrap">
                 <a href="{{NEW_API_URL}}/console/token" target="_blank" class="btn btn-primary text-base">🔑 获取API Key</a>
+                <a href="{{NEW_API_URL}}/console" target="_blank" class="btn btn-console text-base">🖥️ 控制台</a>
                 <a href="/claim" target="_top" class="btn btn-secondary text-base">🎫 领取兑换券</a>
             </div>
         </div>
@@ -598,12 +758,13 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     </main>
 
     <footer class="text-center py-6 text-gray-600 text-sm">
-        每 <span id="cd-hours">{{COOLDOWN}}</span> 小时可领取一次 | <a href="/" target="_top" class="text-blue-400 hover:underline">返回首页</a> | <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400 hover:underline">钱包充值</a>
+        每 <span id="cd-hours">{{COOLDOWN}}</span> 小时可领取一次 | <a href="{{NEW_API_URL}}/" class="text-blue-400 hover:underline">返回首页</a> | <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400 hover:underline">钱包充值</a>
     </footer>
 
     <script>
     var ud = null;
     var cdHours = {{COOLDOWN}};
+    var NEW_API_URL = '{{NEW_API_URL}}';
 
     (function(){
         var s = localStorage.getItem('coupon_user');
@@ -756,211 +917,6 @@ CLAIM_PAGE = '''<!DOCTYPE html>
 </html>'''
 
 
-ADMIN_PAGE = '''<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>管理后台 - {{SITE_NAME}}</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui,sans-serif}
-        .card{background:#12121a;border:1px solid #1f1f2e;border-radius:12px}
-        .ipt{background:#0d0d12;border:1px solid #1f1f2e;color:#e0e0e0;border-radius:8px;padding:12px 16px;width:100%}
-        .ipt:focus{border-color:#3b82f6;outline:none}
-        .btn{padding:12px 24px;border-radius:8px;font-weight:600;border:none;cursor:pointer;width:100%}
-        .btn-blue{background:#3b82f6;color:#fff}
-        .btn-blue:hover{background:#2563eb}
-        .btn-green{background:#10b981;color:#fff}
-        .btn-green:hover{background:#059669}
-        #overlay{position:fixed;inset:0;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:100}
-        #toast{position:fixed;top:80px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;z-index:200;display:none}
-    </style>
-</head>
-<body class="min-h-screen">
-    <div id="overlay">
-        <div class="card p-8 w-full max-w-sm mx-4">
-            <div class="text-center mb-6">
-                <div class="text-4xl mb-2">🔐</div>
-                <h1 class="text-xl font-bold">管理后台</h1>
-                <p class="text-gray-500 text-sm">请输入管理员密码</p>
-            </div>
-            <input type="password" id="loginPwd" class="ipt mb-4" placeholder="管理员密码">
-            <button type="button" class="btn btn-blue" onclick="doLogin()">登录</button>
-            <a href="/" target="_top" class="block text-center text-gray-500 text-sm mt-4 hover:text-blue-400">← 返回首页</a>
-            <p id="loginErr" class="text-red-500 text-center text-sm mt-2" style="display:none"></p>
-        </div>
-    </div>
-
-    <div id="adminMain" style="display:none">
-        <div class="border-b border-gray-800 py-4 px-6">
-            <div class="max-w-6xl mx-auto flex justify-between items-center">
-                <h1 class="font-bold text-xl">🔧 管理后台</h1>
-                <div class="flex items-center gap-4">
-                    <a href="/" target="_top" class="text-gray-400 hover:text-white text-sm">← 首页</a>
-                    <button type="button" class="text-red-400 text-sm" onclick="doLogout()">退出</button>
-                </div>
-            </div>
-        </div>
-
-        <main class="max-w-6xl mx-auto px-4 py-8">
-            <div class="grid lg:grid-cols-3 gap-6">
-                <div class="lg:col-span-2 space-y-6">
-                    <div class="card p-6">
-                        <h2 class="font-semibold mb-4">📤 添加兑换码</h2>
-                        <div class="grid grid-cols-5 gap-2 mb-4">
-                            <button type="button" onclick="setQ(1)" class="bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold">$1</button>
-                            <button type="button" onclick="setQ(5)" class="bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold">$5</button>
-                            <button type="button" onclick="setQ(10)" class="bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold">$10</button>
-                            <button type="button" onclick="setQ(50)" class="bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold">$50</button>
-                            <button type="button" onclick="setQ(100)" class="bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold">$100</button>
-                        </div>
-                        <div class="flex items-center gap-2 mb-4">
-                            <span class="text-gray-400">额度:</span>
-                            <input type="number" id="quotaVal" value="1" min="0.01" step="0.01" class="w-24 ipt text-center font-bold">
-                            <span class="text-gray-400">美元（支持自定义）</span>
-                        </div>
-                        <div class="mb-4"><label class="block text-sm text-gray-400 mb-2">上传TXT文件</label><input type="file" id="txtFile" accept=".txt" class="ipt"></div>
-                        <button type="button" class="btn btn-blue mb-4" onclick="doUpload()">上传文件</button>
-                        <hr class="border-gray-700 my-4">
-                        <div><label class="block text-sm text-gray-400 mb-2">或手动粘贴</label><textarea id="codesText" rows="4" class="ipt font-mono text-sm" placeholder="每行一个"></textarea></div>
-                        <button type="button" class="btn btn-green mt-3" onclick="doAdd()">添加兑换码</button>
-                    </div>
-                    <div class="card p-6">
-                        <h2 class="font-semibold mb-4">🎰 概率说明</h2>
-                        <div class="grid grid-cols-5 gap-2 text-center text-sm mb-4">
-                            <div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-green-400 font-bold">$1</div><div class="text-gray-500">50%</div></div>
-                            <div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-blue-400 font-bold">$5</div><div class="text-gray-500">30%</div></div>
-                            <div class="bg-purple-900/30 p-3 rounded border border-purple-800"><div class="text-purple-400 font-bold">$10</div><div class="text-gray-500">15%</div></div>
-                            <div class="bg-orange-900/30 p-3 rounded border border-orange-800"><div class="text-orange-400 font-bold">$50</div><div class="text-gray-500">4%</div></div>
-                            <div class="bg-red-900/30 p-3 rounded border border-red-800"><div class="text-red-400 font-bold">$100</div><div class="text-gray-500">1%</div></div>
-                        </div>
-                        <p class="text-gray-500 text-xs">自定义额度：额度越大概率越低（自动计算）</p>
-                    </div>
-                </div>
-                <div class="space-y-6">
-                    <div class="card p-6"><div class="flex justify-between items-center mb-4"><h2 class="font-semibold">📊 统计</h2><button type="button" class="text-blue-400 text-sm" onclick="loadStats()">刷新</button></div><div id="statsBox">加载中...</div></div>
-                    <div class="card p-6"><h2 class="font-semibold mb-4">📋 最近领取</h2><div id="recentBox" class="max-h-80 overflow-y-auto space-y-2 text-sm"></div></div>
-                </div>
-            </div>
-        </main>
-    </div>
-    <div id="toast"></div>
-
-    <script>
-    var pwd = '';
-    (function(){
-        var s = sessionStorage.getItem('admin_pwd');
-        if(s){ pwd = s; verifyPwd(); }
-        document.getElementById('loginPwd').onkeydown = function(e){ if(e.key==='Enter') doLogin(); };
-    })();
-
-    function toast(msg, ok){
-        var t = document.getElementById('toast');
-        t.textContent = msg; t.style.display = 'block'; t.style.background = ok ? '#10b981' : '#ef4444';
-        setTimeout(function(){ t.style.display = 'none'; }, 3000);
-    }
-
-    function doLogin(){
-        var p = document.getElementById('loginPwd').value;
-        var err = document.getElementById('loginErr');
-        if(!p){ err.textContent = '请输入密码'; err.style.display = 'block'; return; }
-        err.style.display = 'none';
-
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/admin/login', true);
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        xhr.onreadystatechange = function(){
-            if(xhr.readyState === 4){
-                if(xhr.status === 200){
-                    pwd = p; sessionStorage.setItem('admin_pwd', p);
-                    document.getElementById('overlay').style.display = 'none';
-                    document.getElementById('adminMain').style.display = 'block';
-                    loadStats();
-                } else {
-                    err.textContent = '密码错误'; err.style.display = 'block';
-                }
-            }
-        };
-        xhr.onerror = function(){ err.textContent = '网络错误'; err.style.display = 'block'; };
-        xhr.send(JSON.stringify({password: p}));
-    }
-
-    function verifyPwd(){
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', '/api/admin/stats?password=' + encodeURIComponent(pwd), true);
-        xhr.onreadystatechange = function(){
-            if(xhr.readyState === 4){
-                if(xhr.status === 200){
-                    document.getElementById('overlay').style.display = 'none';
-                    document.getElementById('adminMain').style.display = 'block';
-                    loadStats();
-                } else { sessionStorage.removeItem('admin_pwd'); pwd = ''; }
-            }
-        };
-        xhr.send();
-    }
-
-    function doLogout(){ sessionStorage.removeItem('admin_pwd'); pwd = ''; location.reload(); }
-    function setQ(q){ document.getElementById('quotaVal').value = q; }
-
-    function doUpload(){
-        var q = document.getElementById('quotaVal').value;
-        var f = document.getElementById('txtFile').files[0];
-        if(!f){ toast('请选择文件', false); return; }
-        var fd = new FormData(); fd.append('password', pwd); fd.append('quota', q); fd.append('file', f);
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/admin/upload-txt', true);
-        xhr.onreadystatechange = function(){
-            if(xhr.readyState === 4){
-                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200); if(xhr.status === 200){ loadStats(); document.getElementById('txtFile').value = ''; } }catch(e){ toast('失败', false); }
-            }
-        };
-        xhr.send(fd);
-    }
-
-    function doAdd(){
-        var q = parseFloat(document.getElementById('quotaVal').value);
-        var txt = document.getElementById('codesText').value;
-        var arr = txt.split('\\n').filter(function(s){ return s.trim(); });
-        if(!arr.length){ toast('请输入兑换码', false); return; }
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/admin/add-coupons', true);
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        xhr.onreadystatechange = function(){
-            if(xhr.readyState === 4){
-                try{ var res = JSON.parse(xhr.responseText); toast(res.message || res.detail, xhr.status === 200); if(xhr.status === 200){ loadStats(); document.getElementById('codesText').value = ''; } }catch(e){ toast('失败', false); }
-            }
-        };
-        xhr.send(JSON.stringify({password: pwd, quota: q, coupons: arr}));
-    }
-
-    function loadStats(){
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', '/api/admin/stats?password=' + encodeURIComponent(pwd), true);
-        xhr.onreadystatechange = function(){
-            if(xhr.readyState === 4 && xhr.status === 200){
-                try{
-                    var res = JSON.parse(xhr.responseText);
-                    if(res.success){
-                        var d = res.data;
-                        var h = '<div class="grid grid-cols-3 gap-2 text-center mb-4"><div class="bg-gray-800 p-3 rounded"><div class="text-xl font-bold">'+d.total+'</div><div class="text-xs text-gray-500">总数</div></div><div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-xl font-bold text-green-400">'+d.available+'</div><div class="text-xs text-gray-500">可用</div></div><div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-xs text-gray-500">已领</div></div></div><div class="space-y-1">';
-                        for(var k in d.quota_stats){ var v = d.quota_stats[k]; h += '<div class="flex justify-between text-sm bg-gray-800/50 p-2 rounded"><span>'+k+'</span><span class="text-green-400">'+v.available+'</span><span class="text-gray-500">'+v.claimed+'</span></div>'; }
-                        h += '</div>';
-                        document.getElementById('statsBox').innerHTML = h;
-                        var rh = '';
-                        for(var i=0; i<d.recent_claims.length; i++){ var c = d.recent_claims[i]; rh += '<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span> <span class="text-gray-600">'+c.time+'</span></div>'; }
-                        document.getElementById('recentBox').innerHTML = rh || '<p class="text-gray-600">暂无</p>';
-                    }
-                }catch(e){}
-            }
-        };
-        xhr.send();
-    }
-    </script>
-</body>
-</html>'''
-
 # ============ 管理后台 HTML ============
 ADMIN_PAGE = '''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -979,8 +935,11 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         .btn-blue:hover{background:#2563eb}
         .btn-green{background:#10b981;color:#fff}
         .btn-green:hover{background:#059669}
+        .btn-purple{background:#8b5cf6;color:#fff}
+        .btn-purple:hover{background:#7c3aed}
         #overlay{position:fixed;inset:0;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:100}
         #toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;z-index:200;display:none}
+        .weight-input{width:60px;text-align:center;padding:8px;font-size:14px}
     </style>
 </head>
 <body class="min-h-screen">
@@ -1014,6 +973,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         <main class="max-w-6xl mx-auto px-4 py-8">
             <div class="grid lg:grid-cols-3 gap-6">
                 <div class="lg:col-span-2 space-y-6">
+                    <!-- 添加兑换码 -->
                     <div class="card p-6">
                         <h2 class="font-semibold mb-4">📤 添加兑换码</h2>
                         <div class="grid grid-cols-5 gap-2 mb-4">
@@ -1041,14 +1001,30 @@ ADMIN_PAGE = '''<!DOCTYPE html>
                         <button type="button" class="btn btn-green mt-3" onclick="doAddCodes()">添加兑换码</button>
                     </div>
 
+                    <!-- 系统配置 -->
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4">🎰 概率说明</h2>
-                        <div class="grid grid-cols-5 gap-2 text-center text-sm">
-                            <div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-green-400 font-bold">$1</div><div class="text-gray-500">50%</div></div>
-                            <div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-blue-400 font-bold">$5</div><div class="text-gray-500">30%</div></div>
-                            <div class="bg-purple-900/30 p-3 rounded border border-purple-800"><div class="text-purple-400 font-bold">$10</div><div class="text-gray-500">15%</div></div>
-                            <div class="bg-orange-900/30 p-3 rounded border border-orange-800"><div class="text-orange-400 font-bold">$50</div><div class="text-gray-500">4%</div></div>
-                            <div class="bg-red-900/30 p-3 rounded border border-red-800"><div class="text-red-400 font-bold">$100</div><div class="text-gray-500">1%</div></div>
+                        <h2 class="font-semibold mb-4">⚙️ 系统配置</h2>
+                        
+                        <!-- 冷却时间 -->
+                        <div class="mb-6">
+                            <label class="block text-sm text-gray-400 mb-2">领取冷却时间（小时）</label>
+                            <div class="flex items-center gap-3">
+                                <input type="number" id="cooldownHours" min="1" max="168" class="w-24 ipt text-center font-bold">
+                                <span class="text-gray-500">小时</span>
+                                <button type="button" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm" onclick="saveCooldown()">保存</button>
+                            </div>
+                        </div>
+                        
+                        <!-- 概率配置 -->
+                        <div>
+                            <label class="block text-sm text-gray-400 mb-3">抽奖概率权重（数值越大概率越高）</label>
+                            <div id="weightsContainer" class="space-y-2"></div>
+                            <div class="mt-4 flex gap-2">
+                                <input type="number" id="newQuotaKey" placeholder="额度" class="w-20 ipt text-center text-sm">
+                                <input type="number" id="newQuotaWeight" placeholder="权重" class="w-20 ipt text-center text-sm">
+                                <button type="button" class="bg-green-600 hover:bg-green-700 text-white px-3 py-2 rounded text-sm" onclick="addWeight()">添加</button>
+                            </div>
+                            <button type="button" class="btn btn-purple mt-4" onclick="saveWeights()">保存概率配置</button>
                         </div>
                     </div>
                 </div>
@@ -1074,6 +1050,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 
     <script>
     var adminPwd = '';
+    var currentWeights = {};
 
     // 页面加载时检查session
     (function(){
@@ -1205,6 +1182,76 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         xhr.send(JSON.stringify({password: adminPwd, quota: q, coupons: arr}));
     }
 
+    function renderWeights(weights){
+        currentWeights = weights || {};
+        var container = document.getElementById('weightsContainer');
+        var html = '';
+        var colors = {'1':'green','5':'blue','10':'purple','50':'orange','100':'red'};
+        
+        for(var k in currentWeights){
+            var color = colors[k] || 'gray';
+            html += '<div class="flex items-center gap-2 bg-'+color+'-900/30 p-2 rounded border border-'+color+'-800">';
+            html += '<span class="text-'+color+'-400 font-bold w-16">$'+k+'</span>';
+            html += '<input type="number" min="0" value="'+currentWeights[k]+'" onchange="updateWeight(\\''+k+'\\', this.value)" class="weight-input ipt">';
+            html += '<span class="text-gray-500 text-sm">权重</span>';
+            html += '<button type="button" onclick="removeWeight(\\''+k+'\\')" class="text-red-400 hover:text-red-300 ml-2">✕</button>';
+            html += '</div>';
+        }
+        container.innerHTML = html || '<p class="text-gray-500">暂无配置</p>';
+    }
+
+    function updateWeight(key, val){
+        currentWeights[key] = parseInt(val) || 0;
+    }
+
+    function removeWeight(key){
+        delete currentWeights[key];
+        renderWeights(currentWeights);
+    }
+
+    function addWeight(){
+        var key = document.getElementById('newQuotaKey').value;
+        var val = document.getElementById('newQuotaWeight').value;
+        if(!key || !val){ toast('请输入额度和权重', false); return; }
+        currentWeights[key] = parseInt(val);
+        renderWeights(currentWeights);
+        document.getElementById('newQuotaKey').value = '';
+        document.getElementById('newQuotaWeight').value = '';
+    }
+
+    function saveCooldown(){
+        var hours = parseInt(document.getElementById('cooldownHours').value);
+        if(!hours || hours < 1){ toast('冷却时间至少1小时', false); return; }
+        
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/update-config', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                try{
+                    var res = JSON.parse(xhr.responseText);
+                    toast(res.message || res.detail, xhr.status === 200);
+                }catch(e){ toast('请求失败', false); }
+            }
+        };
+        xhr.send(JSON.stringify({password: adminPwd, cooldown_hours: hours}));
+    }
+
+    function saveWeights(){
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/admin/update-config', true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function(){
+            if(xhr.readyState === 4){
+                try{
+                    var res = JSON.parse(xhr.responseText);
+                    toast(res.message || res.detail, xhr.status === 200);
+                }catch(e){ toast('请求失败', false); }
+            }
+        };
+        xhr.send(JSON.stringify({password: adminPwd, quota_weights: currentWeights}));
+    }
+
     function loadStats(){
         var xhr = new XMLHttpRequest();
         xhr.open('GET', '/api/admin/stats?password=' + encodeURIComponent(adminPwd), true);
@@ -1214,11 +1261,18 @@ ADMIN_PAGE = '''<!DOCTYPE html>
                     var res = JSON.parse(xhr.responseText);
                     if(res.success){
                         var d = res.data;
+                        
+                        // 更新配置显示
+                        document.getElementById('cooldownHours').value = d.cooldown_hours || 8;
+                        renderWeights(d.quota_weights);
+                        
                         var h = '<div class="grid grid-cols-3 gap-2 text-center mb-4">';
                         h += '<div class="bg-gray-800 p-3 rounded"><div class="text-xl font-bold">'+d.total+'</div><div class="text-xs text-gray-500">总数</div></div>';
                         h += '<div class="bg-green-900/30 p-3 rounded border border-green-800"><div class="text-xl font-bold text-green-400">'+d.available+'</div><div class="text-xs text-gray-500">可用</div></div>';
                         h += '<div class="bg-blue-900/30 p-3 rounded border border-blue-800"><div class="text-xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-xs text-gray-500">已领</div></div>';
-                        h += '</div><div class="space-y-1">';
+                        h += '</div>';
+                        h += '<div class="bg-purple-900/30 p-2 rounded border border-purple-800 mb-4 text-center"><span class="text-purple-400">冷却时间: '+d.cooldown_hours+'小时</span></div>';
+                        h += '<div class="space-y-1">';
                         for(var k in d.quota_stats){
                             var v = d.quota_stats[k];
                             h += '<div class="flex justify-between text-sm bg-gray-800/50 p-2 rounded"><span>'+k+'</span><span class="text-green-400">'+v.available+'</span><span class="text-gray-500">'+v.claimed+'</span></div>';
