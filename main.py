@@ -28,10 +28,13 @@ DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR}/coupon.db")
 SITE_NAME = os.getenv("SITE_NAME", "velvenode")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
+# 大奖阈值（>=此金额显示为大奖）
+BIG_PRIZE_THRESHOLD = float(os.getenv("BIG_PRIZE_THRESHOLD", "50"))
+
 DEFAULT_COOLDOWN_MINUTES = 480
 DEFAULT_CLAIM_TIMES = 1
 DEFAULT_QUOTA_WEIGHTS = {"1": 50, "5": 30, "10": 15, "50": 4, "100": 1}
-DEFAULT_DISPLAY_COUNT = 100
+DEFAULT_QUOTA_STOCK = {"1": 100, "5": 50, "10": 20, "50": 5, "100": 1}  # 新增：默认虚拟库存
 DEFAULT_CLAIM_MODE = "A"
 DEFAULT_QUOTA_RATE = 500000
 
@@ -143,9 +146,14 @@ def get_quota_weights(db):
     val = get_config(db, "quota_weights")
     return json.loads(val) if val else DEFAULT_QUOTA_WEIGHTS.copy()
 
-def get_display_count(db):
-    val = get_config(db, "display_count")
-    return int(val) if val else DEFAULT_DISPLAY_COUNT
+def get_quota_stock(db):
+    """获取虚拟库存配置"""
+    val = get_config(db, "quota_stock")
+    return json.loads(val) if val else DEFAULT_QUOTA_STOCK.copy()
+
+def set_quota_stock(db, stock: dict):
+    """设置虚拟库存"""
+    set_config(db, "quota_stock", json.dumps(stock))
 
 def get_claim_mode(db):
     val = get_config(db, "claim_mode")
@@ -162,8 +170,8 @@ def init_default_config(db: Session):
         set_config(db, "claim_times", str(DEFAULT_CLAIM_TIMES))
     if not get_config(db, "quota_weights"):
         set_config(db, "quota_weights", json.dumps(DEFAULT_QUOTA_WEIGHTS))
-    if not get_config(db, "display_count"):
-        set_config(db, "display_count", str(DEFAULT_DISPLAY_COUNT))
+    if not get_config(db, "quota_stock"):
+        set_config(db, "quota_stock", json.dumps(DEFAULT_QUOTA_STOCK))
     if not get_config(db, "claim_mode"):
         set_config(db, "claim_mode", DEFAULT_CLAIM_MODE)
     if not get_config(db, "quota_rate"):
@@ -177,7 +185,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 # ============ 用户验证 ============
 async def verify_user_by_access_token(user_id: int, access_token: str) -> dict | None:
-    """用 用户ID + Access Token 验证并获取用户信息"""
     if not access_token or len(access_token) < 10:
         return None
     if not user_id or user_id < 1:
@@ -201,7 +208,6 @@ async def verify_user_by_access_token(user_id: int, access_token: str) -> dict |
             user_data = data.get("data", {})
             returned_id = user_data.get("id")
             username = user_data.get("username")
-            # 验证返回的用户ID与提交的一致
             if returned_id != user_id:
                 return None
             if not username:
@@ -216,7 +222,6 @@ async def verify_user_by_access_token(user_id: int, access_token: str) -> dict |
         return None
 
 async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> str | None:
-    """调用 New API 创建兑换码"""
     if not ADMIN_ACCESS_TOKEN:
         return None
     quota_rate = get_quota_rate(db)
@@ -250,7 +255,6 @@ async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> s
         return None
 
 async def topup_user(user_id: int, user_access_token: str, redemption_code: str) -> bool:
-    """帮用户充值"""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
@@ -268,22 +272,140 @@ async def topup_user(user_id: int, user_access_token: str, redemption_code: str)
     except:
         return False
 
-def get_random_quota(db: Session) -> float:
-    weights = get_quota_weights(db)
-    if not weights:
-        return 1.0
-    quotas = []
-    weight_values = []
-    for q, w in weights.items():
-        quotas.append(float(q))
-        weight_values.append(float(w))
-    return random.choices(quotas, weights=weight_values, k=1)[0]
+def get_total_available_stock(db: Session) -> int:
+    """计算总可用库存（本地兑换码 + 虚拟库存）"""
+    claim_mode = get_claim_mode(db)
+    quota_stock = get_quota_stock(db)
+    
+    if claim_mode == "A":
+        # A模式：本地兑换码数量 + 虚拟库存中没有本地兑换码的部分
+        local_count = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
+        
+        # 统计本地各金额的数量
+        local_by_quota = {}
+        local_coupons = db.query(CouponPool).filter(CouponPool.is_claimed == False).all()
+        for c in local_coupons:
+            q_str = str(c.quota_dollars)
+            local_by_quota[q_str] = local_by_quota.get(q_str, 0) + 1
+        
+        # 计算虚拟库存中超出本地的部分
+        virtual_extra = 0
+        for q_str, stock in quota_stock.items():
+            local_qty = local_by_quota.get(q_str, 0)
+            if stock > local_qty:
+                virtual_extra += (stock - local_qty)
+        
+        return local_count + virtual_extra
+    else:
+        # B模式：纯虚拟库存
+        return sum(max(0, int(v)) for v in quota_stock.values())
+
+def get_available_quotas_for_draw(db: Session) -> list:
+    """获取可抽取的金额列表（库存>0的）"""
+    claim_mode = get_claim_mode(db)
+    quota_stock = get_quota_stock(db)
+    quota_weights = get_quota_weights(db)
+    
+    available = []
+    
+    if claim_mode == "A":
+        # A模式：检查本地兑换码或虚拟库存
+        for q_str, weight in quota_weights.items():
+            quota = float(q_str)
+            # 检查本地是否有
+            local_count = db.query(CouponPool).filter(
+                CouponPool.is_claimed == False,
+                CouponPool.quota_dollars == quota
+            ).count()
+            # 检查虚拟库存
+            virtual_stock = int(quota_stock.get(q_str, 0))
+            
+            if local_count > 0 or virtual_stock > 0:
+                available.append({
+                    "quota": quota,
+                    "weight": float(weight),
+                    "local_count": local_count,
+                    "virtual_stock": virtual_stock
+                })
+    else:
+        # B模式：只看虚拟库存
+        for q_str, weight in quota_weights.items():
+            virtual_stock = int(quota_stock.get(q_str, 0))
+            if virtual_stock > 0:
+                available.append({
+                    "quota": float(q_str),
+                    "weight": float(weight),
+                    "local_count": 0,
+                    "virtual_stock": virtual_stock
+                })
+    
+    return available
+
+def draw_random_quota(db: Session) -> float | None:
+    """根据权重和库存抽取金额"""
+    available = get_available_quotas_for_draw(db)
+    if not available:
+        return None
+    
+    quotas = [item["quota"] for item in available]
+    weights = [item["weight"] for item in available]
+    
+    return random.choices(quotas, weights=weights, k=1)[0]
+
+def deduct_virtual_stock(db: Session, quota: float) -> bool:
+    """扣减虚拟库存"""
+    quota_stock = get_quota_stock(db)
+    q_str = str(quota)
+    
+    # 处理整数和浮点数的key匹配
+    if q_str not in quota_stock:
+        q_str = str(int(quota)) if quota == int(quota) else q_str
+    
+    current = int(quota_stock.get(q_str, 0))
+    if current > 0:
+        quota_stock[q_str] = current - 1
+        set_quota_stock(db, quota_stock)
+        return True
+    return False
 
 def get_local_coupon(db: Session, quota: float):
     return db.query(CouponPool).filter(
         CouponPool.is_claimed == False,
         CouponPool.quota_dollars == quota
     ).first()
+
+def get_big_prizes(db: Session) -> list:
+    """获取大奖信息（用于前端展示）"""
+    quota_stock = get_quota_stock(db)
+    quota_weights = get_quota_weights(db)
+    claim_mode = get_claim_mode(db)
+    
+    big_prizes = []
+    
+    for q_str in quota_weights.keys():
+        quota = float(q_str)
+        if quota >= BIG_PRIZE_THRESHOLD:
+            virtual_stock = int(quota_stock.get(q_str, 0))
+            
+            if claim_mode == "A":
+                # A模式还要加上本地兑换码
+                local_count = db.query(CouponPool).filter(
+                    CouponPool.is_claimed == False,
+                    CouponPool.quota_dollars == quota
+                ).count()
+                total = max(local_count, virtual_stock)  # 取较大值（因为本地优先消耗）
+            else:
+                total = virtual_stock
+            
+            if total > 0:
+                big_prizes.append({
+                    "quota": quota,
+                    "count": total
+                })
+    
+    # 按金额降序排列
+    big_prizes.sort(key=lambda x: x["quota"], reverse=True)
+    return big_prizes
 
 def format_cooldown(minutes: int) -> str:
     if minutes >= 60:
@@ -371,10 +493,14 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
         s = cooldown_seconds % 60
         cooldown_text = f"{h}小时 {m}分钟 {s}秒" if h > 0 else f"{m}分钟 {s}秒"
     
-    display_count = get_display_count(db)
-    if display_count <= 0:
+    # 计算总可用库存
+    total_stock = get_total_available_stock(db)
+    if total_stock <= 0:
         can_claim = False
         cooldown_text = "兑换码已领完，请等待补充"
+    
+    # 获取大奖信息
+    big_prizes = get_big_prizes(db)
     
     history = db.query(ClaimRecord).filter(ClaimRecord.user_id == user_id).order_by(ClaimRecord.claim_time.desc()).limit(10).all()
     
@@ -385,9 +511,10 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
             "username": user_info["username"],
             "can_claim": can_claim,
             "cooldown_text": cooldown_text,
-            "available_count": display_count,
+            "available_count": total_stock,
             "remaining_claims": remaining_claims,
             "claim_times": claim_times,
+            "big_prizes": big_prizes,
             "history": [
                 {
                     "coupon_code": r.coupon_code,
@@ -419,7 +546,6 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     
     username = user_info["username"]
     cooldown_minutes = get_cooldown_minutes(db)
-    claim_times = get_claim_times(db)
     now = now_utc()
     
     can_claim, remaining_claims, cooldown_seconds, _ = calculate_user_cooldown_status(db, user_id, now)
@@ -431,16 +557,23 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
         else:
             raise HTTPException(status_code=400, detail=f"冷却中，请在 {total_min}分钟 后再试")
     
-    display_count = get_display_count(db)
-    if display_count <= 0:
-        raise HTTPException(status_code=400, detail="兑换码已领完")
+    # 检查是否有可用库存
+    total_stock = get_total_available_stock(db)
+    if total_stock <= 0:
+        raise HTTPException(status_code=400, detail="兑换码已领完，请等待补充")
     
-    quota = get_random_quota(db)
+    # 抽取金额
+    quota = draw_random_quota(db)
+    if quota is None:
+        raise HTTPException(status_code=400, detail="没有可用的兑换码")
+    
     claim_mode = get_claim_mode(db)
     coupon_code = None
     auto_redeemed = False
+    used_local = False
     
     if claim_mode == "A":
+        # A模式：优先本地兑换码
         local_coupon = get_local_coupon(db, quota)
         if local_coupon:
             coupon_code = local_coupon.coupon_code
@@ -448,9 +581,18 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
             local_coupon.claimed_by_user_id = user_id
             local_coupon.claimed_by_username = username
             local_coupon.claimed_at = now
+            used_local = True
         else:
+            # 本地没有，检查虚拟库存并调用API
+            quota_stock = get_quota_stock(db)
+            q_str = str(quota) if str(quota) in quota_stock else str(int(quota))
+            if int(quota_stock.get(q_str, 0)) <= 0:
+                raise HTTPException(status_code=400, detail=f"${quota} 兑换码已领完")
+            
             coupon_code = await create_redemption_code_via_api(quota, db)
             if coupon_code:
+                # 扣减虚拟库存
+                deduct_virtual_stock(db, quota)
                 new_coupon = CouponPool(
                     coupon_code=coupon_code,
                     quota_dollars=quota,
@@ -462,8 +604,16 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
                 )
                 db.add(new_coupon)
     else:
+        # B模式：直接调用API，使用虚拟库存
+        quota_stock = get_quota_stock(db)
+        q_str = str(quota) if str(quota) in quota_stock else str(int(quota))
+        if int(quota_stock.get(q_str, 0)) <= 0:
+            raise HTTPException(status_code=400, detail=f"${quota} 兑换码已领完")
+        
         coupon_code = await create_redemption_code_via_api(quota, db)
         if coupon_code:
+            # 扣减虚拟库存
+            deduct_virtual_stock(db, quota)
             new_coupon = CouponPool(
                 coupon_code=coupon_code,
                 quota_dollars=quota,
@@ -474,6 +624,7 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
                 source="api"
             )
             db.add(new_coupon)
+            # B模式自动充值
             if await topup_user(user_id, access_token, coupon_code):
                 auto_redeemed = True
     
@@ -491,10 +642,6 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
         auto_redeemed=auto_redeemed
     )
     db.add(record)
-    
-    new_display = max(0, display_count - 1)
-    set_config(db, "display_count", str(new_display))
-    
     db.commit()
     
     return {
@@ -619,34 +766,45 @@ async def delete_coupons_batch(request: Request, db: Session = Depends(get_db)):
 async def get_stats(password: str, db: Session = Depends(get_db)):
     if password != ADMIN_PASSWORD:
         raise HTTPException(status_code=401, detail="密码错误")
+    
     total = db.query(CouponPool).count()
     available = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
     claimed = db.query(CouponPool).filter(CouponPool.is_claimed == True).count()
+    
     from sqlalchemy import distinct
     all_quotas = db.query(distinct(CouponPool.quota_dollars)).all()
     all_quotas = sorted([q[0] for q in all_quotas])
+    
     quota_stats = {}
     for q in all_quotas:
         avail = db.query(CouponPool).filter(CouponPool.is_claimed == False, CouponPool.quota_dollars == q).count()
         used = db.query(CouponPool).filter(CouponPool.is_claimed == True, CouponPool.quota_dollars == q).count()
         if avail > 0 or used > 0:
             quota_stats[f"${q}"] = {"available": avail, "claimed": used}
+    
     recent = db.query(ClaimRecord).order_by(ClaimRecord.claim_time.desc()).limit(50).all()
+    
+    # 获取虚拟库存
+    quota_stock = get_quota_stock(db)
+    total_virtual_stock = get_total_available_stock(db)
+    
     return {
         "success": True,
         "data": {
             "total": total,
             "available": available,
             "claimed": claimed,
+            "total_virtual_stock": total_virtual_stock,
             "quota_stats": quota_stats,
             "cooldown_minutes": get_cooldown_minutes(db),
             "claim_times": get_claim_times(db),
             "quota_weights": get_quota_weights(db),
-            "display_count": get_display_count(db),
+            "quota_stock": quota_stock,
             "claim_mode": get_claim_mode(db),
             "quota_rate": get_quota_rate(db),
             "timezone_offset": TIMEZONE_OFFSET_HOURS,
             "admin_token_configured": bool(ADMIN_ACCESS_TOKEN),
+            "big_prize_threshold": BIG_PRIZE_THRESHOLD,
             "recent_claims": [
                 {
                     "user_id": r.user_id,
@@ -672,8 +830,9 @@ async def update_config(request: Request, db: Session = Depends(get_db)):
     if "quota_weights" in body:
         if isinstance(body["quota_weights"], dict):
             set_config(db, "quota_weights", json.dumps(body["quota_weights"]))
-    if "display_count" in body:
-        set_config(db, "display_count", str(int(body["display_count"])))
+    if "quota_stock" in body:
+        if isinstance(body["quota_stock"], dict):
+            set_config(db, "quota_stock", json.dumps(body["quota_stock"]))
     if "claim_mode" in body:
         if body["claim_mode"] in ["A", "B"]:
             set_config(db, "claim_mode", body["claim_mode"])
@@ -683,18 +842,22 @@ async def update_config(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/api/stats/public")
 async def get_public_stats(db: Session = Depends(get_db)):
+    total_stock = get_total_available_stock(db)
+    big_prizes = get_big_prizes(db)
     return {
-        "available": get_display_count(db),
+        "available": total_stock,
         "cooldown_minutes": get_cooldown_minutes(db),
         "cooldown_text": format_cooldown(get_cooldown_minutes(db)),
-        "claim_times": get_claim_times(db)
+        "claim_times": get_claim_times(db),
+        "big_prizes": big_prizes
     }
 
 # ============ 页面路由 ============
 @app.get("/", response_class=HTMLResponse)
 async def index(db: Session = Depends(get_db)):
     html = HOME_PAGE
-    html = html.replace("{{AVAILABLE}}", str(get_display_count(db)))
+    total_stock = get_total_available_stock(db)
+    html = html.replace("{{AVAILABLE}}", str(total_stock))
     html = html.replace("{{SITE_NAME}}", SITE_NAME)
     html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
     html = html.replace("{{COOLDOWN_TEXT}}", format_cooldown(get_cooldown_minutes(db)))
@@ -705,7 +868,8 @@ async def index(db: Session = Depends(get_db)):
 @app.get("/claim", response_class=HTMLResponse)
 async def claim_page(db: Session = Depends(get_db)):
     html = CLAIM_PAGE
-    html = html.replace("{{AVAILABLE}}", str(get_display_count(db)))
+    total_stock = get_total_available_stock(db)
+    html = html.replace("{{AVAILABLE}}", str(total_stock))
     html = html.replace("{{SITE_NAME}}", SITE_NAME)
     html = html.replace("{{NEW_API_URL}}", NEW_API_URL)
     html = html.replace("{{COOLDOWN_TEXT}}", format_cooldown(get_cooldown_minutes(db)))
@@ -832,6 +996,7 @@ resp = client.chat.completions.create(
                         <h3 class="text-xl font-bold mb-2">免费领取API额度</h3>
                         <p class="text-gray-400 mb-3">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次，随机获得对应额度的兑换码</p>
                         <span class="inline-block bg-green-900/40 text-green-400 px-4 py-1.5 rounded-full border border-green-800 text-sm">📦 当前可领: <b id="avail-cnt">{{AVAILABLE}}</b> 个</span>
+                        <div id="bigPrizesHome" class="mt-3"></div>
                     </div>
                     <a href="/claim" target="_top" class="btn btn-primary text-lg px-8 py-3">🎁 立即领取 →</a>
                 </div>
@@ -874,6 +1039,14 @@ resp = client.chat.completions.create(
             document.getElementById('avail-cnt').textContent=d.available;
             document.getElementById('cd-text').textContent=d.cooldown_text;
             document.getElementById('claim-times').textContent=d.claim_times;
+            if(d.big_prizes && d.big_prizes.length > 0){
+                var html='<div class="flex gap-2 flex-wrap">';
+                d.big_prizes.forEach(function(p){
+                    html+='<span class="bg-yellow-900/50 text-yellow-400 px-2 py-1 rounded text-xs border border-yellow-700">🏆 $'+p.quota+' x'+p.count+'</span>';
+                });
+                html+='</div>';
+                document.getElementById('bigPrizesHome').innerHTML=html;
+            }
         }).catch(()=>{});
     </script>
 </body>
@@ -906,71 +1079,92 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         @keyframes pop{0%{transform:scale(0.5);opacity:0}50%{transform:scale(1.1)}100%{transform:scale(1);opacity:1}}
         .cpn{background:linear-gradient(135deg,#3b82f6,#1d4ed8);border-radius:8px;padding:12px;margin-bottom:8px}
         .amount-big{font-size:48px;font-weight:800;background:linear-gradient(135deg,#fbbf24,#f59e0b);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+        .big-prize-card{background:linear-gradient(135deg,#fbbf24,#f59e0b);border-radius:12px;padding:16px;color:#000}
+        .big-prize-item{background:rgba(0,0,0,0.2);border-radius:8px;padding:8px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
     </style>
 </head>
 <body class="min-h-screen">
-    <main class="max-w-md mx-auto px-4 py-8">
-        <div id="sec-login" class="card p-8">
-            <div class="text-center mb-6">
-                <div class="text-5xl mb-4">🎁</div>
-                <h1 class="text-2xl font-bold">兑换券领取中心</h1>
-                <p class="text-gray-400 mt-2">验证身份后领取免费额度</p>
-                <div class="mt-4 inline-flex items-center bg-blue-900/30 text-blue-300 px-4 py-2 rounded-full border border-blue-800">📦 当前可领: <span id="cnt" class="font-bold ml-1">{{AVAILABLE}}</span> 个</div>
-            </div>
-            <div class="space-y-4">
-                <div>
-                    <label class="block text-sm text-gray-400 mb-1">用户ID</label>
-                    <input type="number" id="uid" class="ipt" placeholder="在个人设置页面查看">
-                </div>
-                <div>
-                    <label class="block text-sm text-gray-400 mb-1">系统访问令牌</label>
-                    <input type="password" id="token" class="ipt" placeholder="请输入系统访问令牌">
-                </div>
-                <div class="p-3 bg-blue-900/20 border border-blue-800 rounded-lg">
-                    <p class="text-xs text-blue-300 mb-2">📍 获取步骤：</p>
-                    <p class="text-xs text-gray-400 mb-2">1. 点击下方按钮进入个人设置<br>2. 查看页面顶部的 <b class="text-blue-300">ID: 数字</b> 即为用户ID<br>3. 找到「安全设置」→「系统访问令牌」→「生成令牌」</p>
-                    <a href="{{NEW_API_URL}}/console/personal" target="_blank" class="btn-link">🔑 前往个人设置</a>
-                </div>
-                <button type="button" class="btn-p" onclick="doVerify()">验证身份</button>
-            </div>
-        </div>
-
-        <div id="sec-claim" style="display:none">
-            <div class="card p-4 mb-4">
-                <div class="flex justify-between items-center">
-                    <div><p class="text-gray-500 text-sm">当前用户</p><p id="uinfo" class="font-semibold"></p></div>
-                    <button type="button" class="text-blue-400 text-sm hover:underline" onclick="doLogout()">切换账号</button>
-                </div>
-            </div>
-            <div class="card p-6 mb-4">
-                <div class="flex justify-between items-center mb-4">
-                    <h2 class="font-semibold">领取状态</h2>
-                    <div class="flex items-center gap-2">
-                        <span id="remainBadge" class="px-2 py-1 rounded text-xs bg-purple-900/50 text-purple-400 border border-purple-700"></span>
-                        <span id="badge" class="px-3 py-1 rounded-full text-sm"></span>
+    <main class="max-w-4xl mx-auto px-4 py-8">
+        <div class="grid md:grid-cols-3 gap-6">
+            <!-- 左侧：登录/领取区域 -->
+            <div class="md:col-span-2">
+                <div id="sec-login" class="card p-8">
+                    <div class="text-center mb-6">
+                        <div class="text-5xl mb-4">🎁</div>
+                        <h1 class="text-2xl font-bold">兑换券领取中心</h1>
+                        <p class="text-gray-400 mt-2">验证身份后领取免费额度</p>
+                        <div class="mt-4 inline-flex items-center bg-blue-900/30 text-blue-300 px-4 py-2 rounded-full border border-blue-800">📦 当前可领: <span id="cnt" class="font-bold ml-1">{{AVAILABLE}}</span> 个</div>
+                    </div>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm text-gray-400 mb-1">用户ID</label>
+                            <input type="number" id="uid" class="ipt" placeholder="在个人设置页面查看">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-gray-400 mb-1">系统访问令牌</label>
+                            <input type="password" id="token" class="ipt" placeholder="请输入系统访问令牌">
+                        </div>
+                        <div class="p-3 bg-blue-900/20 border border-blue-800 rounded-lg">
+                            <p class="text-xs text-blue-300 mb-2">📍 获取步骤：</p>
+                            <p class="text-xs text-gray-400 mb-2">1. 点击下方按钮进入个人设置<br>2. 查看页面顶部的 <b class="text-blue-300">ID: 数字</b> 即为用户ID<br>3. 找到「安全设置」→「系统访问令牌」→「生成令牌」</p>
+                            <a href="{{NEW_API_URL}}/console/personal" target="_blank" class="btn-link">🔑 前往个人设置</a>
+                        </div>
+                        <button type="button" class="btn-p" onclick="doVerify()">验证身份</button>
                     </div>
                 </div>
-                <div class="text-center py-4">
-                    <button type="button" id="claimBtn" class="btn-c" onclick="doClaim()">🎰 抽取兑换券</button>
-                    <p id="cdMsg" class="text-gray-500 mt-3 text-sm"></p>
-                </div>
-                <div id="prizeBox" style="display:none" class="text-center py-6">
-                    <div class="prize">
-                        <div class="text-gray-400 mb-2">🎉 恭喜获得</div>
-                        <div id="prizeAmount" class="amount-big mb-4"></div>
-                        <div id="autoRedeemMsg" class="text-green-400 text-sm mb-3" style="display:none">✅ 已自动充值到您的账户</div>
-                        <div id="manualRedeemBox">
-                            <div class="text-gray-400 text-sm mb-2">兑换码:</div>
-                            <div id="prizeCode" class="font-mono text-lg bg-gray-800 p-3 rounded-lg border border-gray-700 mb-3"></div>
-                            <button type="button" class="text-blue-400 text-sm hover:underline" onclick="copyPrize()">📋 复制兑换码</button>
-                            <p class="text-xs text-gray-500 mt-2">请前往 <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400">钱包充值</a> 页面兑换</p>
+
+                <div id="sec-claim" style="display:none">
+                    <div class="card p-4 mb-4">
+                        <div class="flex justify-between items-center">
+                            <div><p class="text-gray-500 text-sm">当前用户</p><p id="uinfo" class="font-semibold"></p></div>
+                            <button type="button" class="text-blue-400 text-sm hover:underline" onclick="doLogout()">切换账号</button>
                         </div>
                     </div>
+                    <div class="card p-6 mb-4">
+                        <div class="flex justify-between items-center mb-4">
+                            <h2 class="font-semibold">领取状态</h2>
+                            <div class="flex items-center gap-2">
+                                <span id="remainBadge" class="px-2 py-1 rounded text-xs bg-purple-900/50 text-purple-400 border border-purple-700"></span>
+                                <span id="badge" class="px-3 py-1 rounded-full text-sm"></span>
+                            </div>
+                        </div>
+                        <div class="text-center py-4">
+                            <button type="button" id="claimBtn" class="btn-c" onclick="doClaim()">🎰 抽取兑换券</button>
+                            <p id="cdMsg" class="text-gray-500 mt-3 text-sm"></p>
+                        </div>
+                        <div id="prizeBox" style="display:none" class="text-center py-6">
+                            <div class="prize">
+                                <div class="text-gray-400 mb-2">🎉 恭喜获得</div>
+                                <div id="prizeAmount" class="amount-big mb-4"></div>
+                                <div id="autoRedeemMsg" class="text-green-400 text-sm mb-3" style="display:none">✅ 已自动充值到您的账户</div>
+                                <div id="manualRedeemBox">
+                                    <div class="text-gray-400 text-sm mb-2">兑换码:</div>
+                                    <div id="prizeCode" class="font-mono text-lg bg-gray-800 p-3 rounded-lg border border-gray-700 mb-3"></div>
+                                    <button type="button" class="text-blue-400 text-sm hover:underline" onclick="copyPrize()">📋 复制兑换码</button>
+                                    <p class="text-xs text-gray-500 mt-2">请前往 <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400">钱包充值</a> 页面兑换</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card p-6">
+                        <h2 class="font-semibold mb-3">📋 领取记录</h2>
+                        <div id="hist"></div>
+                    </div>
                 </div>
             </div>
-            <div class="card p-6">
-                <h2 class="font-semibold mb-3">📋 领取记录</h2>
-                <div id="hist"></div>
+
+            <!-- 右侧：大奖展示 -->
+            <div class="md:col-span-1">
+                <div id="bigPrizeSection" class="card p-6" style="display:none">
+                    <h2 class="font-semibold mb-4 flex items-center gap-2">🏆 大奖池</h2>
+                    <div id="bigPrizeList"></div>
+                    <p class="text-xs text-gray-500 mt-3">以上大奖等你来抽！</p>
+                </div>
+                <div id="noBigPrize" class="card p-6 text-center text-gray-500">
+                    <div class="text-4xl mb-2">🎰</div>
+                    <p class="text-sm">暂无大奖</p>
+                    <p class="text-xs mt-1">敬请期待</p>
+                </div>
             </div>
         </div>
     </main>
@@ -991,12 +1185,41 @@ CLAIM_PAGE = '''<!DOCTYPE html>
                 document.getElementById('token').value = d.access_token || '';
             }catch(e){}
         }
+        loadPublicStats();
+    })();
+
+    function loadPublicStats(){
         fetch('/api/stats/public').then(r=>r.json()).then(d=>{
             document.getElementById('cnt').textContent=d.available;
             document.getElementById('cd-text').textContent=d.cooldown_text;
             document.getElementById('claim-times').textContent=d.claim_times;
+            renderBigPrizes(d.big_prizes);
         }).catch(()=>{});
-    })();
+    }
+
+    function renderBigPrizes(prizes){
+        var section = document.getElementById('bigPrizeSection');
+        var noPrize = document.getElementById('noBigPrize');
+        var list = document.getElementById('bigPrizeList');
+        
+        if(!prizes || prizes.length === 0){
+            section.style.display = 'none';
+            noPrize.style.display = 'block';
+            return;
+        }
+        
+        section.style.display = 'block';
+        noPrize.style.display = 'none';
+        
+        var html = '';
+        prizes.forEach(function(p){
+            html += '<div class="big-prize-item bg-gradient-to-r from-yellow-900/50 to-orange-900/50 border border-yellow-700">';
+            html += '<span class="text-yellow-400 font-bold text-lg">$' + p.quota + '</span>';
+            html += '<span class="bg-yellow-500 text-black px-2 py-1 rounded font-bold text-sm">x' + p.count + '</span>';
+            html += '</div>';
+        });
+        list.innerHTML = html;
+    }
 
     function toast(msg,ok){
         var t=document.createElement('div');
@@ -1050,7 +1273,10 @@ CLAIM_PAGE = '''<!DOCTYPE html>
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({user_id:userData.user_id,access_token:userData.access_token})
         }).then(r=>r.json()).then(res=>{
-            if(res.success)updateUI(res.data);
+            if(res.success){
+                updateUI(res.data);
+                if(res.data.big_prizes) renderBigPrizes(res.data.big_prizes);
+            }
         }).catch(()=>{});
     }
 
@@ -1111,6 +1337,7 @@ CLAIM_PAGE = '''<!DOCTYPE html>
                 toast(data.detail||'领取失败',false);
             }
             loadStatus();
+            loadPublicStats();
         }).catch(()=>{btn.innerHTML='🎰 抽取兑换券';toast('网络错误',false);loadStatus();});
     }
 
@@ -1195,7 +1422,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
             <div id="tab-coupons" class="tab-content" style="display:none">
                 <div class="card p-6">
                     <div class="flex flex-wrap justify-between items-center gap-4 mb-4">
-                        <h2 class="font-semibold">🎫 兑换码列表</h2>
+                        <h2 class="font-semibold">🎫 本地兑换码列表</h2>
                         <div class="flex gap-2 flex-wrap">
                             <select id="couponStatus" class="ipt w-auto" onchange="loadCoupons(1)">
                                 <option value="all">全部</option>
@@ -1225,7 +1452,8 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 
             <div id="tab-add" class="tab-content" style="display:none">
                 <div class="card p-6">
-                    <h2 class="font-semibold mb-4">➕ 添加兑换码（本地）</h2>
+                    <h2 class="font-semibold mb-4">➕ 添加本地兑换码</h2>
+                    <p class="text-sm text-gray-500 mb-4">本地兑换码在A模式下优先使用，B模式下不使用本地兑换码</p>
                     <div class="grid grid-cols-5 gap-2 mb-4">
                         <button onclick="setQuota(0.1)" class="bg-gray-700 text-gray-300 py-2 rounded font-bold hover:opacity-80">$0.1</button>
                         <button onclick="setQuota(0.5)" class="bg-gray-700 text-gray-300 py-2 rounded font-bold hover:opacity-80">$0.5</button>
@@ -1273,19 +1501,14 @@ ADMIN_PAGE = '''<!DOCTYPE html>
                     </div>
 
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4">📊 显示与额度</h2>
+                        <h2 class="font-semibold mb-4">📊 额度比例</h2>
                         <div class="space-y-4">
-                            <div>
-                                <label class="block text-sm text-gray-400 mb-2">显示可领取数量</label>
-                                <input type="number" id="displayCount" min="0" class="w-full ipt">
-                                <p class="text-xs text-gray-500 mt-1">用户看到的"当前可领"数量，每次领取自动减1</p>
-                            </div>
                             <div>
                                 <label class="block text-sm text-gray-400 mb-2">额度比例（$1 = ? quota）</label>
                                 <input type="number" id="quotaRate" min="1" class="w-full ipt">
                                 <p class="text-xs text-gray-500 mt-1">New API 的 quota 换算比例，默认 500000</p>
                             </div>
-                            <button class="btn btn-blue w-full" onclick="saveDisplayConfig()">保存显示配置</button>
+                            <button class="btn btn-blue w-full" onclick="saveQuotaRate()">保存额度比例</button>
                         </div>
                     </div>
 
@@ -1305,14 +1528,17 @@ ADMIN_PAGE = '''<!DOCTYPE html>
                     </div>
 
                     <div class="card p-6">
-                        <h2 class="font-semibold mb-4">🎰 概率权重</h2>
-                        <div id="weightsContainer" class="max-h-64 overflow-y-auto mb-4"></div>
+                        <h2 class="font-semibold mb-4">🎰 概率权重 & 虚拟库存</h2>
+                        <p class="text-xs text-gray-500 mb-2">设置各金额的抽取权重和可用库存数量</p>
+                        <p class="text-xs text-yellow-500 mb-4">⚠️ 库存为0的金额不会被抽中；所有库存为0时无法抽奖</p>
+                        <div id="weightsContainer" class="max-h-80 overflow-y-auto mb-4"></div>
                         <div class="flex gap-2 mb-4">
-                            <input type="number" id="newQuotaKey" step="0.01" placeholder="额度" class="w-24 ipt text-center text-sm">
-                            <input type="number" id="newQuotaWeight" step="0.01" placeholder="权重" class="w-24 ipt text-center text-sm">
+                            <input type="number" id="newQuotaKey" step="0.01" placeholder="额度" class="w-20 ipt text-center text-sm">
+                            <input type="number" id="newQuotaWeight" step="0.01" placeholder="权重" class="w-20 ipt text-center text-sm">
+                            <input type="number" id="newQuotaStock" placeholder="库存" class="w-20 ipt text-center text-sm">
                             <button class="btn btn-green" onclick="addWeight()">添加</button>
                         </div>
-                        <button class="btn btn-purple w-full" onclick="saveWeights()">保存概率配置</button>
+                        <button class="btn btn-purple w-full" onclick="saveWeightsAndStock()">保存概率与库存配置</button>
                     </div>
                 </div>
             </div>
@@ -1322,7 +1548,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     <div id="toast"></div>
 
     <script>
-    var adminPwd='';var currentWeights={};var selectedCoupons=new Set();var currentPage=1;var currentMode='A';
+    var adminPwd='';var currentWeights={};var currentStock={};var selectedCoupons=new Set();var currentPage=1;var currentMode='A';
 
     (function(){
         var saved=sessionStorage.getItem('admin_pwd');
@@ -1384,7 +1610,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 
     function renderCoupons(data){
         var html='';
-        data.coupons.forEach(c=>{
+        data.coupons.forEach(function(c){
             var statusClass=c.is_claimed?'text-gray-500':'text-green-400';
             var statusText=c.is_claimed?'已领取':'可用';
             var sourceTag=c.source==='api'?'<span class="text-xs text-purple-400 ml-1">[API]</span>':'';
@@ -1411,51 +1637,113 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 
     function deleteBatch(type){if(!confirm('确定删除？'))return;fetch('/api/admin/delete-coupons-batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,type:type})}).then(r=>r.json()).then(d=>{toast(d.message,d.success);if(d.success)loadCoupons(1);});}
 
-    function renderWeights(weights){
-        currentWeights={};for(var k in weights)currentWeights[k]=weights[k];
+    function renderWeightsAndStock(weights, stock){
+        currentWeights={};currentStock={};
+        for(var k in weights)currentWeights[k]=weights[k];
+        for(var k in stock)currentStock[k]=stock[k];
+        
+        // 合并所有key
+        var allKeys = new Set([...Object.keys(currentWeights), ...Object.keys(currentStock)]);
+        var sortedKeys = Array.from(allKeys).sort((a,b)=>parseFloat(a)-parseFloat(b));
+        
         var html='';
-        Object.keys(currentWeights).sort((a,b)=>parseFloat(a)-parseFloat(b)).forEach(k=>{
-            html+='<div class="weight-row"><span class="text-blue-400 font-bold w-20">$'+k+'</span><input type="number" step="0.01" min="0" value="'+currentWeights[k]+'" onchange="updateWeight(\\''+k+'\\',this.value)" class="w-20 ipt text-center text-sm"><span class="text-gray-500 text-sm">权重</span><button onclick="removeWeight(\\''+k+'\\')" class="text-red-400 ml-auto">✕</button></div>';
+        sortedKeys.forEach(function(k){
+            var weight = currentWeights[k] || 0;
+            var stockVal = currentStock[k] || 0;
+            var isBigPrize = parseFloat(k) >= 50;
+            var rowClass = isBigPrize ? 'bg-yellow-900/20 border border-yellow-800' : 'bg-gray-800/50';
+            
+            html+='<div class="weight-row '+rowClass+'">';
+            html+='<span class="text-blue-400 font-bold w-16">$'+k+'</span>';
+            if(isBigPrize) html+='<span class="text-yellow-400 text-xs">🏆</span>';
+            html+='<input type="number" step="0.01" min="0" value="'+weight+'" onchange="updateWeight(\\''+k+'\\', this.value)" class="w-16 ipt text-center text-sm" title="权重">';
+            html+='<span class="text-gray-500 text-xs">权重</span>';
+            html+='<input type="number" min="0" value="'+stockVal+'" onchange="updateStock(\\''+k+'\\', this.value)" class="w-16 ipt text-center text-sm '+(stockVal<=0?'border-red-500':'')+'" title="库存">';
+            html+='<span class="text-gray-500 text-xs">库存</span>';
+            html+='<button onclick="removeQuota(\\''+k+'\\')" class="text-red-400 ml-auto">✕</button>';
+            html+='</div>';
         });
         document.getElementById('weightsContainer').innerHTML=html||'<p class="text-gray-500">暂无配置</p>';
     }
 
     function updateWeight(key,val){currentWeights[key]=parseFloat(val)||0;}
-    function removeWeight(key){delete currentWeights[key];renderWeights(currentWeights);}
-    function addWeight(){var key=document.getElementById('newQuotaKey').value;var val=document.getElementById('newQuotaWeight').value;if(!key||!val){toast('请输入额度和权重',false);return;}currentWeights[key]=parseFloat(val);renderWeights(currentWeights);document.getElementById('newQuotaKey').value='';document.getElementById('newQuotaWeight').value='';}
+    function updateStock(key,val){currentStock[key]=parseInt(val)||0;}
+    function removeQuota(key){delete currentWeights[key];delete currentStock[key];renderWeightsAndStock(currentWeights,currentStock);}
+
+    function addWeight(){
+        var key=document.getElementById('newQuotaKey').value;
+        var weight=document.getElementById('newQuotaWeight').value;
+        var stock=document.getElementById('newQuotaStock').value;
+        if(!key){toast('请输入额度',false);return;}
+        currentWeights[key]=parseFloat(weight)||1;
+        currentStock[key]=parseInt(stock)||0;
+        renderWeightsAndStock(currentWeights,currentStock);
+        document.getElementById('newQuotaKey').value='';
+        document.getElementById('newQuotaWeight').value='';
+        document.getElementById('newQuotaStock').value='';
+    }
 
     function toggleMode(){currentMode=currentMode==='A'?'B':'A';updateModeUI();fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,claim_mode:currentMode})}).then(r=>r.json()).then(d=>toast(d.message,d.success));}
 
     function updateModeUI(){
         var sw=document.getElementById('modeSwitch');var desc=document.getElementById('modeDesc');
-        if(currentMode==='B'){sw.classList.add('on');desc.innerHTML='<b>模式B（自动充值）</b>：用户领取后，系统自动调用 API 创建兑换码并充值到用户账户';}
-        else{sw.classList.remove('on');desc.innerHTML='<b>模式A（返回兑换码）</b>：优先使用本地兑换码，没有则调用 API 创建，用户需自行兑换';}
+        if(currentMode==='B'){sw.classList.add('on');desc.innerHTML='<b>模式B（自动充值）</b>：直接调用API创建兑换码并自动充值到用户账户，使用虚拟库存控制';}
+        else{sw.classList.remove('on');desc.innerHTML='<b>模式A（返回兑换码）</b>：优先使用本地兑换码池，没有则调用API创建，用户需自行兑换';}
     }
 
-    function saveCooldownConfig(){var minutes=parseInt(document.getElementById('cooldownMinutes').value);var times=parseInt(document.getElementById('claimTimes').value);fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,cooldown_minutes:minutes,claim_times:times})}).then(r=>r.json()).then(d=>toast(d.message,d.success));}
+    function saveCooldownConfig(){
+        var minutes=parseInt(document.getElementById('cooldownMinutes').value);
+        var times=parseInt(document.getElementById('claimTimes').value);
+        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,cooldown_minutes:minutes,claim_times:times})}).then(r=>r.json()).then(d=>toast(d.message,d.success));
+    }
 
-    function saveDisplayConfig(){var count=parseInt(document.getElementById('displayCount').value);var rate=parseInt(document.getElementById('quotaRate').value);fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,display_count:count,quota_rate:rate})}).then(r=>r.json()).then(d=>toast(d.message,d.success));}
+    function saveQuotaRate(){
+        var rate=parseInt(document.getElementById('quotaRate').value);
+        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,quota_rate:rate})}).then(r=>r.json()).then(d=>toast(d.message,d.success));
+    }
 
-    function saveWeights(){fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,quota_weights:currentWeights})}).then(r=>r.json()).then(d=>toast(d.message,d.success));}
+    function saveWeightsAndStock(){
+        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,quota_weights:currentWeights,quota_stock:currentStock})}).then(r=>r.json()).then(d=>{toast(d.message,d.success);if(d.success)loadStats();});
+    }
 
     function loadStats(){
         fetch('/api/admin/stats?password='+encodeURIComponent(adminPwd)).then(r=>r.json()).then(res=>{
             if(!res.success)return;var d=res.data;
             document.getElementById('cooldownMinutes').value=d.cooldown_minutes;
             document.getElementById('claimTimes').value=d.claim_times;
-            document.getElementById('displayCount').value=d.display_count;
             document.getElementById('quotaRate').value=d.quota_rate;
-            currentMode=d.claim_mode;updateModeUI();renderWeights(d.quota_weights);
+            currentMode=d.claim_mode;updateModeUI();
+            renderWeightsAndStock(d.quota_weights, d.quota_stock);
+            
             var tokenStatus=document.getElementById('tokenStatus');
             tokenStatus.textContent=d.admin_token_configured?'✅ 已配置管理员令牌':'❌ 未配置管理员令牌';
             tokenStatus.className='text-xs mt-1 '+(d.admin_token_configured?'text-green-400':'text-red-400');
+            
             var h='<div class="grid grid-cols-3 gap-4 mb-6">';
             h+='<div class="bg-gray-800 p-4 rounded-lg text-center"><div class="text-2xl font-bold">'+d.total+'</div><div class="text-gray-500 text-sm">本地总数</div></div>';
-            h+='<div class="bg-green-900/30 p-4 rounded-lg text-center border border-green-800"><div class="text-2xl font-bold text-green-400">'+d.display_count+'</div><div class="text-gray-500 text-sm">显示可领</div></div>';
+            h+='<div class="bg-green-900/30 p-4 rounded-lg text-center border border-green-800"><div class="text-2xl font-bold text-green-400">'+d.total_virtual_stock+'</div><div class="text-gray-500 text-sm">可抽取总库存</div></div>';
             h+='<div class="bg-blue-900/30 p-4 rounded-lg text-center border border-blue-800"><div class="text-2xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-gray-500 text-sm">已领取</div></div>';
-            h+='</div><div class="space-y-2">';
+            h+='</div>';
+            
+            // 显示虚拟库存状态
+            h+='<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">📦 虚拟库存状态</h3><div class="grid grid-cols-2 md:grid-cols-4 gap-2">';
+            var stockKeys = Object.keys(d.quota_stock).sort((a,b)=>parseFloat(a)-parseFloat(b));
+            stockKeys.forEach(function(k){
+                var v = d.quota_stock[k];
+                var colorClass = v > 0 ? 'bg-green-900/30 border-green-800 text-green-400' : 'bg-red-900/30 border-red-800 text-red-400';
+                var isBig = parseFloat(k) >= d.big_prize_threshold;
+                h+='<div class="'+colorClass+' border rounded p-2 text-center">';
+                if(isBig) h+='<span class="text-yellow-400">🏆</span> ';
+                h+='<span class="font-bold">$'+k+'</span>: <span>'+v+'</span></div>';
+            });
+            h+='</div></div>';
+            
+            // 本地兑换码统计
+            h+='<div class="space-y-2"><h3 class="text-sm font-semibold text-gray-400 mb-2">🎫 本地兑换码</h3>';
             for(var k in d.quota_stats){var v=d.quota_stats[k];h+='<div class="flex justify-between text-sm bg-gray-800/50 p-3 rounded"><span class="font-bold">'+k+'</span><span class="text-green-400">本地可用: '+v.available+'</span><span class="text-gray-500">已领: '+v.claimed+'</span></div>';}
-            h+='</div>';document.getElementById('statsBox').innerHTML=h;
+            h+='</div>';
+            document.getElementById('statsBox').innerHTML=h;
+            
             var rh='';d.recent_claims.forEach(c=>{var autoTag=c.auto_redeemed?'<span class="text-green-400 text-xs">[自动]</span>':'';rh+='<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span> '+autoTag+'<br><span class="text-gray-600 text-xs">'+c.time+'</span></div>';});
             document.getElementById('recentBox').innerHTML=rh||'<p class="text-gray-600">暂无</p>';
         });
