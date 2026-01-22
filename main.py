@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException, Request, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, Depends, UploadFile, File, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Float, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sqlalchemy import text
@@ -9,24 +9,24 @@ import httpx
 import random
 import os
 import json
+import hashlib
+import secrets
 
 # ============ 配置 ============
-NEW_API_URL = os.getenv("NEW_API_URL", "https://velvenode.zeabur.app")
-COUPON_SITE_URL = os.getenv("COUPON_SITE_URL", "https://velvenodehome.zeabur.app")
+NEW_API_URL = os.getenv("NEW_API_URL", "https://velvenode.top")
+COUPON_SITE_URL = os.getenv("COUPON_SITE_URL", "https://coupon.velvenode.top")
+SITE_NAME = os.getenv("SITE_NAME", "velvenode")
 
 ADMIN_ACCESS_TOKEN = os.getenv("ADMIN_ACCESS_TOKEN", "")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "1")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
 TIMEZONE_OFFSET_HOURS = int(os.getenv("TIMEZONE_OFFSET_HOURS", "8"))
 APP_TIMEZONE = timezone(timedelta(hours=TIMEZONE_OFFSET_HOURS))
 
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
-
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR}/coupon.db")
-
-SITE_NAME = os.getenv("SITE_NAME", "velvenode")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
 BIG_PRIZE_THRESHOLD = float(os.getenv("BIG_PRIZE_THRESHOLD", "50"))
 
@@ -69,6 +69,17 @@ class SystemConfig(Base):
     config_key = Column(String(64), unique=True, nullable=False)
     config_value = Column(Text, nullable=False)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class UserSession(Base):
+    """用户会话表 - 用于存储已验证的用户"""
+    __tablename__ = "user_sessions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_token = Column(String(64), unique=True, nullable=False, index=True)
+    user_id = Column(Integer, nullable=False)
+    username = Column(String(255), nullable=False)
+    main_site_session = Column(String(512), nullable=True)  # 存储主站 session 用于充值
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at = Column(DateTime, nullable=False)
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -161,7 +172,6 @@ def get_quota_rate(db):
     return int(val) if val else DEFAULT_QUOTA_RATE
 
 def get_probability_mode(db):
-    """获取概率计算模式: weight_only=仅权重, weight_stock=权重×库存"""
     val = get_config(db, "probability_mode")
     return val if val in ["weight_only", "weight_stock"] else "weight_stock"
 
@@ -179,7 +189,7 @@ def init_default_config(db: Session):
     if not get_config(db, "quota_rate"):
         set_config(db, "quota_rate", str(DEFAULT_QUOTA_RATE))
     if not get_config(db, "probability_mode"):
-        set_config(db, "probability_mode", "weight_stock")  # 默认权重×库存
+        set_config(db, "probability_mode", "weight_stock")
 
 with SessionLocal() as db:
     init_default_config(db)
@@ -187,22 +197,52 @@ with SessionLocal() as db:
 app = FastAPI(title="兑换券系统")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ============ 用户验证 ============
-async def verify_user_by_access_token(user_id: int, access_token: str) -> dict | None:
-    if not access_token or len(access_token) < 10:
+# ============ 会话管理 ============
+def create_session(db: Session, user_id: int, username: str, main_session: str = None) -> str:
+    """创建本站会话"""
+    # 清理该用户的旧会话
+    db.query(UserSession).filter(UserSession.user_id == user_id).delete()
+    
+    token = secrets.token_hex(32)
+    expires = now_utc() + timedelta(days=7)
+    
+    session = UserSession(
+        session_token=token,
+        user_id=user_id,
+        username=username,
+        main_site_session=main_session,
+        expires_at=expires
+    )
+    db.add(session)
+    db.commit()
+    return token
+
+def get_session(db: Session, token: str) -> UserSession | None:
+    """获取有效会话"""
+    if not token:
         return None
-    if not user_id or user_id < 1:
+    session = db.query(UserSession).filter(
+        UserSession.session_token == token,
+        UserSession.expires_at > now_utc()
+    ).first()
+    return session
+
+def delete_session(db: Session, token: str):
+    """删除会话"""
+    db.query(UserSession).filter(UserSession.session_token == token).delete()
+    db.commit()
+
+# ============ 用户验证 ============
+async def verify_user_by_main_session(session_cookie: str) -> dict | None:
+    """通过主站的 session cookie 验证用户"""
+    if not session_cookie:
         return None
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{NEW_API_URL}/api/user/self",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "New-Api-User": str(user_id),
-                    "Content-Type": "application/json"
-                }
+                cookies={"session": session_cookie}
             )
             if response.status_code != 200:
                 return None
@@ -210,19 +250,17 @@ async def verify_user_by_access_token(user_id: int, access_token: str) -> dict |
             if not data.get("success"):
                 return None
             user_data = data.get("data", {})
-            returned_id = user_data.get("id")
+            user_id = user_data.get("id")
             username = user_data.get("username")
-            if returned_id != user_id:
-                return None
-            if not username:
+            if not user_id or not username:
                 return None
             return {
-                "user_id": returned_id,
+                "user_id": user_id,
                 "username": username,
                 "display_name": user_data.get("display_name", username)
             }
     except Exception as e:
-        print(f"验证失败: {e}")
+        print(f"Session验证失败: {e}")
         return None
 
 async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> str | None:
@@ -260,16 +298,16 @@ async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> s
         print(f"创建兑换码异常: {e}")
         return None
 
-async def topup_user(user_id: int, user_access_token: str, redemption_code: str) -> bool:
+async def topup_user_by_session(main_session: str, redemption_code: str) -> bool:
+    """使用主站 session 为用户充值"""
+    if not main_session:
+        return False
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
                 f"{NEW_API_URL}/api/user/topup",
-                headers={
-                    "Authorization": f"Bearer {user_access_token}",
-                    "New-Api-User": str(user_id),
-                    "Content-Type": "application/json"
-                },
+                cookies={"session": main_session},
+                headers={"Content-Type": "application/json"},
                 json={"key": redemption_code}
             )
             if response.status_code != 200:
@@ -285,11 +323,9 @@ async def topup_user(user_id: int, user_access_token: str, redemption_code: str)
         return False
 
 def get_stock_key(quota_stock: dict, quota: float) -> str:
-    """获取库存中对应的key（处理整数/浮点数匹配）"""
     q_str = str(quota)
     if q_str in quota_stock:
         return q_str
-    # 尝试整数形式
     if quota == int(quota):
         int_str = str(int(quota))
         if int_str in quota_stock:
@@ -297,33 +333,21 @@ def get_stock_key(quota_stock: dict, quota: float) -> str:
     return q_str
 
 def get_total_available_stock(db: Session) -> int:
-    """计算总可用库存"""
     claim_mode = get_claim_mode(db)
     quota_stock = get_quota_stock(db)
     
     if claim_mode == "A":
-        # A模式：本地兑换码 + 虚拟库存（取较大值）
         local_count = db.query(CouponPool).filter(CouponPool.is_claimed == False).count()
         virtual_total = sum(max(0, int(v)) for v in quota_stock.values())
         return max(local_count, virtual_total)
     else:
-        # B模式：纯虚拟库存
         return sum(max(0, int(v)) for v in quota_stock.values())
 
 def draw_random_quota(db: Session) -> float | None:
-    """
-    根据权重和库存抽取金额
-    
-    概率模式:
-    - weight_only: 仅按权重计算，库存只决定是否可抽
-    - weight_stock: 权重 × 库存
-    """
     claim_mode = get_claim_mode(db)
     probability_mode = get_probability_mode(db)
     quota_stock = get_quota_stock(db)
     quota_weights = get_quota_weights(db)
-    
-    print(f"[抽奖] 领取模式: {claim_mode}, 概率模式: {probability_mode}")
     
     available = []
     
@@ -342,40 +366,25 @@ def draw_random_quota(db: Session) -> float | None:
             effective_stock = virtual_stock
         
         if effective_stock > 0:
-            # 根据概率模式计算实际权重
             if probability_mode == "weight_only":
                 actual_weight = float(weight)
-            else:  # weight_stock
+            else:
                 actual_weight = float(weight) * effective_stock
             
             available.append({
                 "quota": quota,
-                "base_weight": float(weight),
-                "stock": effective_stock,
                 "actual_weight": actual_weight
             })
     
     if not available:
-        print("[抽奖] 没有可用的金额")
         return None
-    
-    # 计算并打印概率分布
-    total_weight = sum(item["actual_weight"] for item in available)
-    print(f"[抽奖] 概率分布 (模式: {probability_mode}):")
-    for item in available:
-        prob = item["actual_weight"] / total_weight * 100
-        print(f"  ${item['quota']}: 基础权重={item['base_weight']}, 库存={item['stock']}, 实际权重={item['actual_weight']:.1f}, 概率={prob:.2f}%")
     
     quotas = [item["quota"] for item in available]
     weights = [item["actual_weight"] for item in available]
     
-    result = random.choices(quotas, weights=weights, k=1)[0]
-    print(f"[抽奖] 抽中: ${result}")
-    
-    return result
+    return random.choices(quotas, weights=weights, k=1)[0]
 
 def deduct_virtual_stock(db: Session, quota: float) -> bool:
-    """扣减虚拟库存"""
     quota_stock = get_quota_stock(db)
     stock_key = get_stock_key(quota_stock, quota)
     
@@ -383,7 +392,6 @@ def deduct_virtual_stock(db: Session, quota: float) -> bool:
     if current > 0:
         quota_stock[stock_key] = current - 1
         set_quota_stock(db, quota_stock)
-        print(f"扣减库存: ${quota} {current} -> {current-1}")
         return True
     return False
 
@@ -394,7 +402,6 @@ def get_local_coupon(db: Session, quota: float):
     ).first()
 
 def get_big_prizes(db: Session) -> list:
-    """获取大奖信息"""
     quota_stock = get_quota_stock(db)
     quota_weights = get_quota_weights(db)
     claim_mode = get_claim_mode(db)
@@ -456,47 +463,106 @@ def calculate_user_cooldown_status(db: Session, user_id: int, now: datetime):
             cooldown_seconds = int((earliest_expiry - now).total_seconds())
     return can_claim, remaining_claims, cooldown_seconds, recent_claims
 
-# ============ 用户 API ============
-@app.post("/api/verify")
-async def verify_user(request: Request):
-    body = await request.json()
-    user_id = body.get("user_id")
-    access_token = body.get("access_token", "").strip()
+# ============ 认证 API ============
+@app.get("/api/auth/check")
+async def check_auth(request: Request, db: Session = Depends(get_db)):
+    """检查用户登录状态"""
+    # 优先检查本站 session
+    local_token = request.cookies.get("coupon_session")
+    if local_token:
+        session = get_session(db, local_token)
+        if session:
+            return {
+                "success": True,
+                "logged_in": True,
+                "data": {
+                    "user_id": session.user_id,
+                    "username": session.username
+                }
+            }
     
-    if not user_id:
-        raise HTTPException(status_code=400, detail="请填写用户ID")
-    if not access_token:
-        raise HTTPException(status_code=400, detail="请填写系统访问令牌")
+    # 尝试使用主站 session（cookie 共享场景）
+    main_session = request.cookies.get("session")
+    if main_session:
+        user_info = await verify_user_by_main_session(main_session)
+        if user_info:
+            # 创建本站会话
+            token = create_session(db, user_info["user_id"], user_info["username"], main_session)
+            response_data = {
+                "success": True,
+                "logged_in": True,
+                "data": user_info,
+                "set_cookie": token  # 前端需要设置 cookie
+            }
+            return response_data
     
-    try:
-        user_id = int(user_id)
-    except:
-        raise HTTPException(status_code=400, detail="用户ID必须是数字")
-    
-    user_info = await verify_user_by_access_token(user_id, access_token)
-    if not user_info:
-        raise HTTPException(status_code=401, detail="验证失败，请检查用户ID和令牌是否正确")
-    
-    return {"success": True, "data": user_info}
+    return {"success": False, "logged_in": False, "message": "未登录"}
 
-@app.post("/api/claim/status")
+@app.get("/api/auth/login")
+async def auth_login(request: Request):
+    """重定向到主站登录"""
+    # 记录来源页面
+    redirect_url = f"{COUPON_SITE_URL}/api/auth/callback"
+    # 跳转到主站控制台，用户登录后手动返回
+    return RedirectResponse(
+        url=f"{NEW_API_URL}/console?redirect={redirect_url}",
+        status_code=302
+    )
+
+@app.get("/api/auth/callback")
+async def auth_callback(request: Request, db: Session = Depends(get_db)):
+    """认证回调 - 用户从主站返回后"""
+    main_session = request.cookies.get("session")
+    
+    if main_session:
+        user_info = await verify_user_by_main_session(main_session)
+        if user_info:
+            token = create_session(db, user_info["user_id"], user_info["username"], main_session)
+            response = RedirectResponse(url="/claim", status_code=302)
+            response.set_cookie(
+                key="coupon_session",
+                value=token,
+                max_age=7*24*3600,
+                httponly=True,
+                samesite="lax"
+            )
+            return response
+    
+    # 认证失败，返回领取页
+    return RedirectResponse(url="/claim?error=auth_failed", status_code=302)
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request, db: Session = Depends(get_db)):
+    """登出"""
+    token = request.cookies.get("coupon_session")
+    if token:
+        delete_session(db, token)
+    
+    response = {"success": True}
+    return response
+
+# ============ 领取 API ============
+@app.get("/api/claim/status")
 async def get_claim_status(request: Request, db: Session = Depends(get_db)):
-    body = await request.json()
-    user_id = body.get("user_id")
-    access_token = body.get("access_token", "").strip()
+    """获取领取状态"""
+    # 检查本站会话
+    local_token = request.cookies.get("coupon_session")
+    session = get_session(db, local_token) if local_token else None
     
-    if not user_id or not access_token:
-        raise HTTPException(status_code=400, detail="请填写完整信息")
+    # 也尝试主站 session
+    if not session:
+        main_session = request.cookies.get("session")
+        if main_session:
+            user_info = await verify_user_by_main_session(main_session)
+            if user_info:
+                token = create_session(db, user_info["user_id"], user_info["username"], main_session)
+                session = get_session(db, token)
     
-    try:
-        user_id = int(user_id)
-    except:
-        raise HTTPException(status_code=400, detail="用户ID必须是数字")
+    if not session:
+        raise HTTPException(status_code=401, detail="请先登录")
     
-    user_info = await verify_user_by_access_token(user_id, access_token)
-    if not user_info:
-        raise HTTPException(status_code=401, detail="令牌无效")
-    
+    user_id = session.user_id
+    username = session.username
     claim_times = get_claim_times(db)
     claim_mode = get_claim_mode(db)
     now = now_utc()
@@ -521,8 +587,8 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
     return {
         "success": True,
         "data": {
-            "user_id": user_info["user_id"],
-            "username": user_info["username"],
+            "user_id": user_id,
+            "username": username,
             "can_claim": can_claim,
             "cooldown_text": cooldown_text,
             "available_count": total_stock,
@@ -543,23 +609,24 @@ async def get_claim_status(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/api/claim")
 async def claim_coupon(request: Request, db: Session = Depends(get_db)):
-    body = await request.json()
-    user_id = body.get("user_id")
-    access_token = body.get("access_token", "").strip()
+    """领取兑换券"""
+    local_token = request.cookies.get("coupon_session")
+    session = get_session(db, local_token) if local_token else None
     
-    if not user_id or not access_token:
-        raise HTTPException(status_code=400, detail="请填写完整信息")
+    if not session:
+        main_session = request.cookies.get("session")
+        if main_session:
+            user_info = await verify_user_by_main_session(main_session)
+            if user_info:
+                token = create_session(db, user_info["user_id"], user_info["username"], main_session)
+                session = get_session(db, token)
     
-    try:
-        user_id = int(user_id)
-    except:
-        raise HTTPException(status_code=400, detail="用户ID必须是数字")
+    if not session:
+        raise HTTPException(status_code=401, detail="请先登录")
     
-    user_info = await verify_user_by_access_token(user_id, access_token)
-    if not user_info:
-        raise HTTPException(status_code=401, detail="令牌无效")
-    
-    username = user_info["username"]
+    user_id = session.user_id
+    username = session.username
+    main_session = session.main_site_session
     cooldown_minutes = get_cooldown_minutes(db)
     now = now_utc()
     
@@ -576,21 +643,15 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     if total_stock <= 0:
         raise HTTPException(status_code=400, detail="兑换码已领完，请等待补充")
     
-    # 每次抽奖时重新获取模式，确保使用最新配置
     claim_mode = get_claim_mode(db)
-    print(f"当前领取模式: {claim_mode}")
-    
     quota = draw_random_quota(db)
     if quota is None:
         raise HTTPException(status_code=400, detail="没有可用的兑换码")
-    
-    print(f"抽中金额: ${quota}")
     
     coupon_code = None
     auto_redeemed = False
     
     if claim_mode == "A":
-        # A模式：优先本地兑换码
         local_coupon = get_local_coupon(db, quota)
         if local_coupon:
             coupon_code = local_coupon.coupon_code
@@ -598,10 +659,7 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
             local_coupon.claimed_by_user_id = user_id
             local_coupon.claimed_by_username = username
             local_coupon.claimed_at = now
-            print(f"使用本地兑换码: {coupon_code}")
         else:
-            # 本地没有，调用API创建
-            print(f"本地无 ${quota} 兑换码，调用API创建")
             coupon_code = await create_redemption_code_via_api(quota, db)
             if coupon_code:
                 deduct_virtual_stock(db, quota)
@@ -616,8 +674,6 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
                 )
                 db.add(new_coupon)
     else:
-        # B模式：直接调用API创建并自动充值
-        print(f"B模式：调用API创建 ${quota} 兑换码")
         coupon_code = await create_redemption_code_via_api(quota, db)
         if coupon_code:
             deduct_virtual_stock(db, quota)
@@ -633,12 +689,8 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
             db.add(new_coupon)
             
             # B模式自动充值
-            print(f"尝试自动充值...")
-            if await topup_user(user_id, access_token, coupon_code):
+            if main_session and await topup_user_by_session(main_session, coupon_code):
                 auto_redeemed = True
-                print(f"自动充值成功")
-            else:
-                print(f"自动充值失败，用户需手动兑换")
     
     if not coupon_code:
         raise HTTPException(status_code=500, detail="兑换码生成失败，请稍后重试")
@@ -920,7 +972,7 @@ async def index(db: Session = Depends(get_db)):
     return html
 
 @app.get("/claim", response_class=HTMLResponse)
-async def claim_page(db: Session = Depends(get_db)):
+async def claim_page(request: Request, db: Session = Depends(get_db)):
     html = CLAIM_PAGE
     total_stock = get_total_available_stock(db)
     html = html.replace("{{AVAILABLE}}", str(total_stock))
@@ -944,97 +996,85 @@ HOME_PAGE = '''<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root{--bg:#0a0a0f;--card:#12121a;--border:#1f1f2e;--accent:#3b82f6}
-        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif;padding-top:20px}
+        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif}
         .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
-        .btn{padding:10px 20px;border-radius:8px;font-weight:500;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;gap:6px;cursor:pointer;border:none}
+        .btn{padding:10px 20px;border-radius:8px;font-weight:500;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;border:none;font-size:14px}
         .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
         .btn-secondary{background:#1f1f2e;color:#e0e0e0;border:1px solid #2a2a3a}.btn-secondary:hover{background:#2a2a3a}
         .btn-console{background:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#fff}.btn-console:hover{opacity:0.9}
-        .code-box{background:#0d0d12;border:1px solid var(--border);border-radius:8px;padding:14px 18px;font-family:ui-monospace,monospace}
+        .code-box{background:#0d0d12;border:1px solid var(--border);border-radius:8px;padding:12px 16px;font-family:ui-monospace,monospace}
         .glow{box-shadow:0 0 40px rgba(59,130,246,0.15)}
-        .endpoint-container{height:24px;overflow:hidden;display:inline-block}
-        .endpoint-slider{animation:slideEndpoints 12s infinite}
-        .endpoint-item{height:24px;line-height:24px}
-        @keyframes slideEndpoints{0%,16%{transform:translateY(0)}20%,36%{transform:translateY(-24px)}40%,56%{transform:translateY(-48px)}60%,76%{transform:translateY(-72px)}80%,96%{transform:translateY(-96px)}100%{transform:translateY(0)}}
     </style>
 </head>
 <body class="min-h-screen">
-    <section class="py-16 px-6">
+    <nav class="border-b border-gray-800 px-4 py-3 sticky top-0 bg-[#0a0a0f]/95 backdrop-blur z-50">
+        <div class="max-w-5xl mx-auto flex justify-between items-center">
+            <a href="/" class="text-lg font-bold text-white">{{SITE_NAME}}</a>
+            <div class="flex items-center gap-2">
+                <a href="{{NEW_API_URL}}/console" target="_blank" class="text-gray-400 hover:text-white text-sm px-3 py-1.5">控制台</a>
+                <a href="/claim" class="btn btn-primary text-sm px-4 py-1.5">🎫 领券</a>
+            </div>
+        </div>
+    </nav>
+
+    <section class="py-12 md:py-20 px-4">
         <div class="max-w-3xl mx-auto text-center">
-            <h1 class="text-4xl md:text-5xl font-bold mb-4 bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">统一的大模型API网关</h1>
-            <p class="text-lg text-gray-400 mb-10">更低的价格，更稳定的服务，只需替换API地址即可使用</p>
+            <h1 class="text-3xl md:text-5xl font-bold mb-4 bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent leading-tight">统一的大模型API网关</h1>
+            <p class="text-base md:text-lg text-gray-400 mb-8">更低的价格，更稳定的服务，只需替换API地址即可使用</p>
             
-            <div class="code-box max-w-2xl mx-auto mb-8">
-                <div class="flex items-center justify-between flex-wrap gap-4">
-                    <div class="flex items-center gap-2 text-sm">
-                        <span class="text-gray-500">API地址:</span>
-                        <span class="text-blue-400">{{NEW_API_URL}}</span>
-                        <div class="endpoint-container">
-                            <div class="endpoint-slider">
-                                <div class="endpoint-item text-cyan-400">/v1/chat/completions</div>
-                                <div class="endpoint-item text-cyan-400">/v1/models</div>
-                                <div class="endpoint-item text-cyan-400">/v1/embeddings</div>
-                                <div class="endpoint-item text-cyan-400">/v1/images/generations</div>
-                                <div class="endpoint-item text-cyan-400">/v1/audio/transcriptions</div>
-                            </div>
-                        </div>
+            <div class="code-box max-w-xl mx-auto mb-8">
+                <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                    <div class="flex items-center gap-2 text-sm overflow-hidden">
+                        <span class="text-gray-500 shrink-0">API:</span>
+                        <span class="text-blue-400 truncate">{{NEW_API_URL}}</span>
                     </div>
-                    <button onclick="copyAPI()" id="copy-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded transition">复制</button>
+                    <button onclick="copyAPI()" id="copy-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded transition shrink-0">复制</button>
                 </div>
             </div>
             
-            <div class="flex justify-center gap-4 flex-wrap">
-                <a href="{{NEW_API_URL}}/console/token" target="_blank" class="btn btn-primary text-base">🔑 获取API Key</a>
-                <a href="{{NEW_API_URL}}/console" target="_blank" class="btn btn-console text-base">🖥️ 控制台</a>
-                <a href="/claim" target="_top" class="btn btn-secondary text-base">🎫 领取兑换券</a>
+            <div class="flex flex-wrap justify-center gap-3">
+                <a href="{{NEW_API_URL}}/console/token" target="_blank" class="btn btn-primary">🔑 获取API Key</a>
+                <a href="{{NEW_API_URL}}/console" target="_blank" class="btn btn-console">🖥️ 控制台</a>
+                <a href="/claim" class="btn btn-secondary">🎫 领取兑换券</a>
             </div>
         </div>
     </section>
 
-    <!-- API接入教程 -->
-    <section id="api" class="py-16 px-6 border-t border-gray-800">
+    <section class="py-12 px-4 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>📖</span> API接入教程</h2>
-            <div class="grid md:grid-cols-2 gap-6">
-                <div class="card p-6">
-                    <h3 class="font-semibold text-lg mb-4 text-blue-400">1️⃣ 获取API Key</h3>
-                    <ol class="space-y-2 text-gray-400 text-sm">
-                        <li>1. 访问 <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">{{SITE_NAME}}控制台</a></li>
-                        <li>2. 注册/登录账号</li>
-                        <li>3. 进入「<a href="{{NEW_API_URL}}/console/token" target="_blank" class="text-blue-400 hover:underline">令牌管理</a>」创建API Key</li>
-                        <li>4. 复制生成的 sk-xxx 密钥</li>
+            <h2 class="text-xl md:text-2xl font-bold mb-6 flex items-center gap-2"><span>📖</span> 快速接入</h2>
+            <div class="grid md:grid-cols-2 gap-4">
+                <div class="card p-5">
+                    <h3 class="font-semibold mb-3 text-blue-400">1️⃣ 获取API Key</h3>
+                    <ol class="space-y-1.5 text-gray-400 text-sm">
+                        <li>1. 访问 <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">控制台</a> 注册登录</li>
+                        <li>2. 进入「令牌管理」创建密钥</li>
+                        <li>3. 复制生成的 sk-xxx</li>
                     </ol>
                 </div>
-                <div class="card p-6">
-                    <h3 class="font-semibold text-lg mb-4 text-green-400">2️⃣ 配置API地址</h3>
-                    <div class="code-box text-sm mb-3">
-                        <div class="text-gray-500"># API Base URL</div>
-                        <div class="text-green-400">{{NEW_API_URL}}</div>
+                <div class="card p-5">
+                    <h3 class="font-semibold mb-3 text-green-400">2️⃣ 配置使用</h3>
+                    <div class="code-box text-sm mb-2 py-2">
+                        <div class="text-gray-500 text-xs"># Base URL</div>
+                        <div class="text-green-400 truncate">{{NEW_API_URL}}</div>
                     </div>
-                    <p class="text-gray-400 text-sm">将此地址替换到你的应用中即可</p>
+                    <p class="text-gray-400 text-sm">替换到你的应用中即可</p>
                 </div>
-                <div class="card p-6">
-                    <h3 class="font-semibold text-lg mb-4 text-purple-400">3️⃣ ChatGPT-Next-Web</h3>
-                    <ol class="space-y-2 text-gray-400 text-sm">
-                        <li>1. 设置 → 自定义接口</li>
-                        <li>2. 接口地址: <code class="text-purple-400 bg-purple-900/30 px-1 rounded">{{NEW_API_URL}}</code></li>
-                        <li>3. API Key: 填入你的密钥</li>
-                        <li>4. 保存即可使用</li>
+                <div class="card p-5">
+                    <h3 class="font-semibold mb-3 text-purple-400">3️⃣ ChatGPT-Next-Web</h3>
+                    <ol class="space-y-1.5 text-gray-400 text-sm">
+                        <li>设置 → 自定义接口</li>
+                        <li>接口地址: <code class="text-purple-400 bg-purple-900/30 px-1 rounded text-xs">{{NEW_API_URL}}</code></li>
+                        <li>填入API Key保存即可</li>
                     </ol>
                 </div>
-                <div class="card p-6">
-                    <h3 class="font-semibold text-lg mb-4 text-orange-400">4️⃣ Python调用示例</h3>
-                    <div class="code-box text-xs overflow-x-auto">
+                <div class="card p-5">
+                    <h3 class="font-semibold mb-3 text-orange-400">4️⃣ Python示例</h3>
+                    <div class="code-box text-xs overflow-x-auto py-2">
                         <pre class="text-gray-300">from openai import OpenAI
-
 client = OpenAI(
     api_key="sk-xxx",
     base_url="{{NEW_API_URL}}/v1"
-)
-
-resp = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role":"user","content":"Hi"}]
 )</pre>
                     </div>
                 </div>
@@ -1042,59 +1082,57 @@ resp = client.chat.completions.create(
         </div>
     </section>
 
-    <!-- 兑换券领取 -->
-    <section id="coupon" class="py-16 px-6 border-t border-gray-800">
+    <section class="py-12 px-4 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>🎫</span> 兑换券领取</h2>
-            <div class="card p-8 glow">
-                <div class="flex flex-col md:flex-row items-center justify-between gap-6">
+            <h2 class="text-xl md:text-2xl font-bold mb-6 flex items-center gap-2"><span>🎫</span> 兑换券领取</h2>
+            <div class="card p-6 md:p-8 glow">
+                <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
                     <div>
-                        <h3 class="text-xl font-bold mb-2">免费领取API额度</h3>
-                        <p class="text-gray-400 mb-3">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次，随机获得对应额度的兑换码</p>
-                        <span class="inline-block bg-green-900/40 text-green-400 px-4 py-1.5 rounded-full border border-green-800 text-sm">📦 当前可领: <b id="avail-cnt">{{AVAILABLE}}</b> 个</span>
+                        <h3 class="text-lg md:text-xl font-bold mb-2">免费领取API额度</h3>
+                        <p class="text-gray-400 text-sm mb-3">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次</p>
+                        <span class="inline-block bg-green-900/40 text-green-400 px-3 py-1.5 rounded-full border border-green-800 text-sm">📦 可领: <b id="avail-cnt">{{AVAILABLE}}</b> 个</span>
                         <div id="bigPrizesHome" class="mt-3"></div>
                     </div>
-                    <a href="/claim" target="_top" class="btn btn-primary text-lg px-8 py-3">🎁 立即领取 →</a>
+                    <a href="/claim" class="btn btn-primary text-base px-6 py-3 w-full md:w-auto">🎁 立即领取 →</a>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- 使用须知 -->
-    <section class="py-16 px-6 border-t border-gray-800">
+    <section class="py-12 px-4 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-2xl font-bold mb-8 flex items-center gap-2"><span>📋</span> 使用须知</h2>
-            <div class="grid md:grid-cols-3 gap-6">
-                <div class="card p-6">
-                    <h3 class="font-semibold mb-3 text-blue-400">✅ 允许使用</h3>
+            <h2 class="text-xl md:text-2xl font-bold mb-6 flex items-center gap-2"><span>📋</span> 使用须知</h2>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div class="card p-5">
+                    <h3 class="font-semibold mb-2 text-blue-400 text-sm">✅ 允许使用</h3>
                     <ul class="text-gray-400 text-sm space-y-1">
                         <li>• 个人学习研究</li>
                         <li>• 小型项目开发</li>
                         <li>• 合理频率调用</li>
                     </ul>
                 </div>
-                <div class="card p-6">
-                    <h3 class="font-semibold mb-3 text-red-400">❌ 禁止行为</h3>
+                <div class="card p-5">
+                    <h3 class="font-semibold mb-2 text-red-400 text-sm">❌ 禁止行为</h3>
                     <ul class="text-gray-400 text-sm space-y-1">
                         <li>• 商业盈利用途</li>
                         <li>• 高频滥用接口</li>
                         <li>• 违法违规内容</li>
                     </ul>
                 </div>
-                <div class="card p-6">
-                    <h3 class="font-semibold mb-3 text-yellow-400">⚠️ 注意事项</h3>
+                <div class="card p-5">
+                    <h3 class="font-semibold mb-2 text-yellow-400 text-sm">⚠️ 注意事项</h3>
                     <ul class="text-gray-400 text-sm space-y-1">
                         <li>• 请勿分享API Key</li>
                         <li>• 违规将被封禁</li>
-                        <li>• 额度用完使用兑换码</li>
+                        <li>• 额度用完可领券</li>
                     </ul>
                 </div>
             </div>
         </div>
     </section>
 
-    <footer class="border-t border-gray-800 py-8 px-6 text-center text-gray-500 text-sm">
-        <p>{{SITE_NAME}} © 2025 | <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">控制台</a> | <a href="{{NEW_API_URL}}/pricing" target="_blank" class="text-blue-400 hover:underline">模型广场</a> | <a href="/claim" target="_top" class="text-blue-400 hover:underline">领券中心</a></p>
+    <footer class="border-t border-gray-800 py-6 px-4 text-center text-gray-500 text-sm">
+        <p>{{SITE_NAME}} © 2025 | <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">控制台</a> | <a href="/claim" class="text-blue-400 hover:underline">领券中心</a></p>
     </footer>
 
     <script>
@@ -1130,165 +1168,257 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root{--bg:#0a0a0f;--card:#12121a;--border:#1f1f2e;--accent:#3b82f6}
-        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif;padding-top:20px}
-        .card{background:var(--card);border:1px solid var(--border);border-radius:16px}
-        .ipt{background:#0d0d12;border:1px solid var(--border);color:#e0e0e0;border-radius:8px;padding:12px 16px;width:100%;font-size:14px}
-        .ipt:focus{border-color:var(--accent);outline:none;box-shadow:0 0 0 2px rgba(59,130,246,0.2)}
-        .btn-p{background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;padding:14px;border-radius:8px;font-weight:600;border:none;cursor:pointer;width:100%;font-size:15px}
+        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif}
+        .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
+        .btn-p{background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;padding:12px 24px;border-radius:8px;font-weight:600;border:none;cursor:pointer;font-size:14px;text-decoration:none;display:inline-block;text-align:center}
         .btn-p:hover{opacity:0.9}.btn-p:disabled{background:#374151;cursor:not-allowed}
-        .btn-c{background:linear-gradient(135deg,#10b981,#059669);color:#fff;padding:16px 40px;border-radius:12px;font-weight:700;font-size:18px;border:none;cursor:pointer}
+        .btn-c{background:linear-gradient(135deg,#10b981,#059669);color:#fff;padding:14px 32px;border-radius:10px;font-weight:700;font-size:16px;border:none;cursor:pointer}
         .btn-c:hover{transform:scale(1.02)}.btn-c:disabled{background:#374151;cursor:not-allowed;transform:none}
-        .btn-link{background:#2563eb;color:#fff;padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;display:inline-block}
-        .ld{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,0.3);border-radius:50%;border-top-color:#fff;animation:spin 1s linear infinite}
+        .ld{display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,0.3);border-radius:50%;border-top-color:#fff;animation:spin 1s linear infinite}
         @keyframes spin{to{transform:rotate(360deg)}}
-        .toast{position:fixed;top:80px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;font-weight:500;z-index:9999;animation:fadeIn .3s}
+        .toast{position:fixed;top:70px;left:50%;transform:translateX(-50%);padding:10px 20px;border-radius:8px;color:#fff;font-weight:500;z-index:9999;animation:fadeIn .3s;font-size:14px}
         @keyframes fadeIn{from{opacity:0;transform:translateX(-50%) translateY(-10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
         .prize{animation:pop .5s ease-out}
         @keyframes pop{0%{transform:scale(0.5);opacity:0}50%{transform:scale(1.1)}100%{transform:scale(1);opacity:1}}
-        .cpn{background:linear-gradient(135deg,#3b82f6,#1d4ed8);border-radius:8px;padding:12px;margin-bottom:8px}
-        .amount-big{font-size:48px;font-weight:800;background:linear-gradient(135deg,#fbbf24,#f59e0b);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+        .cpn{background:linear-gradient(135deg,#3b82f6,#1d4ed8);border-radius:8px;padding:10px 12px;margin-bottom:6px}
+        .amount-big{font-size:40px;font-weight:800;background:linear-gradient(135deg,#fbbf24,#f59e0b);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
     </style>
 </head>
 <body class="min-h-screen">
-    <main class="max-w-4xl mx-auto px-4 py-8">
-        <div class="grid md:grid-cols-3 gap-6">
-            <div class="md:col-span-2">
-                <div id="sec-login" class="card p-8">
-                    <div class="text-center mb-6">
-                        <div class="text-5xl mb-4">🎁</div>
-                        <h1 class="text-2xl font-bold">兑换券领取中心</h1>
-                        <p class="text-gray-400 mt-2">验证身份后领取免费额度</p>
-                        <div class="mt-4 inline-flex items-center bg-blue-900/30 text-blue-300 px-4 py-2 rounded-full border border-blue-800">📦 当前可领: <span id="cnt" class="font-bold ml-1">{{AVAILABLE}}</span> 个</div>
-                        <div id="modeIndicator" class="mt-2 text-xs"></div>
-                    </div>
-                    <div class="space-y-4">
-                        <div>
-                            <label class="block text-sm text-gray-400 mb-1">用户ID</label>
-                            <input type="number" id="uid" class="ipt" placeholder="在个人设置页面查看">
-                        </div>
-                        <div>
-                            <label class="block text-sm text-gray-400 mb-1">系统访问令牌</label>
-                            <input type="password" id="token" class="ipt" placeholder="请输入系统访问令牌">
-                        </div>
-                        <div class="p-3 bg-blue-900/20 border border-blue-800 rounded-lg">
-                            <p class="text-xs text-blue-300 mb-2">📍 获取步骤：</p>
-                            <p class="text-xs text-gray-400 mb-2">1. 点击下方按钮进入个人设置<br>2. 查看页面顶部的 <b class="text-blue-300">ID: 数字</b><br>3. 找到「安全设置」→「系统访问令牌」→「生成令牌」</p>
-                            <a href="{{NEW_API_URL}}/console/personal" target="_blank" class="btn-link">🔑 前往个人设置</a>
-                        </div>
-                        <button type="button" class="btn-p" onclick="doVerify()">验证身份</button>
-                    </div>
-                </div>
+    <nav class="border-b border-gray-800 px-4 py-3 sticky top-0 bg-[#0a0a0f]/95 backdrop-blur z-50">
+        <div class="max-w-4xl mx-auto flex justify-between items-center">
+            <a href="/" class="text-lg font-bold text-white">{{SITE_NAME}}</a>
+            <div id="navRight" class="flex items-center gap-2">
+                <span id="navUser" class="text-gray-400 text-sm hidden"></span>
+                <button id="logoutBtn" onclick="doLogout()" class="text-red-400 text-sm hidden hover:underline">退出</button>
+                <a href="/" class="text-gray-400 hover:text-white text-sm px-2">首页</a>
+            </div>
+        </div>
+    </nav>
 
-                <div id="sec-claim" style="display:none">
-                    <div class="card p-4 mb-4">
+    <main class="max-w-4xl mx-auto px-4 py-6">
+        <div id="sec-loading" class="card p-8 text-center">
+            <div class="ld mb-4" style="width:32px;height:32px;border-width:3px;margin:0 auto"></div>
+            <p class="text-gray-400">正在检查登录状态...</p>
+        </div>
+
+        <div id="sec-login" class="card p-6 md:p-8" style="display:none">
+            <div class="text-center mb-6">
+                <div class="text-5xl mb-4">🎁</div>
+                <h1 class="text-xl md:text-2xl font-bold">兑换券领取中心</h1>
+                <p class="text-gray-400 mt-2 text-sm">登录后即可领取免费额度</p>
+                <div class="mt-4 inline-flex items-center bg-blue-900/30 text-blue-300 px-4 py-2 rounded-full border border-blue-800 text-sm">
+                    📦 当前可领: <span id="cnt" class="font-bold ml-1">{{AVAILABLE}}</span> 个
+                </div>
+            </div>
+            
+            <div class="max-w-sm mx-auto">
+                <div class="p-4 bg-green-900/20 border border-green-800 rounded-lg mb-4">
+                    <p class="text-green-400 text-sm mb-2">🚀 一键登录</p>
+                    <p class="text-gray-400 text-xs">点击下方按钮，登录主站后返回即可自动识别</p>
+                </div>
+                <a href="{{NEW_API_URL}}/console" target="_blank" class="btn-p w-full block" id="loginBtn">前往主站登录 →</a>
+                <button onclick="checkAuth()" class="mt-3 w-full text-center text-blue-400 text-sm hover:underline">已登录？点击刷新</button>
+            </div>
+            
+            <div id="bigPrizesLogin" class="mt-6 text-center"></div>
+        </div>
+
+        <div id="sec-claim" style="display:none">
+            <div class="grid md:grid-cols-3 gap-4">
+                <div class="md:col-span-2 space-y-4">
+                    <div class="card p-4">
                         <div class="flex justify-between items-center">
-                            <div><p class="text-gray-500 text-sm">当前用户</p><p id="uinfo" class="font-semibold"></p></div>
-                            <button type="button" class="text-blue-400 text-sm hover:underline" onclick="doLogout()">切换账号</button>
+                            <div>
+                                <p class="text-gray-500 text-xs">当前用户</p>
+                                <p id="uinfo" class="font-semibold text-sm"></p>
+                            </div>
+                            <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 text-sm hover:underline">控制台 →</a>
                         </div>
                     </div>
-                    <div class="card p-6 mb-4">
-                        <div class="flex justify-between items-center mb-4">
-                            <h2 class="font-semibold">领取状态</h2>
-                            <div class="flex items-center gap-2">
-                                <span id="modeBadge" class="px-2 py-1 rounded text-xs"></span>
-                                <span id="remainBadge" class="px-2 py-1 rounded text-xs bg-purple-900/50 text-purple-400 border border-purple-700"></span>
-                                <span id="badge" class="px-3 py-1 rounded-full text-sm"></span>
+                    
+                    <div class="card p-5">
+                        <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
+                            <h2 class="font-semibold text-sm">领取状态</h2>
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span id="modeBadge" class="px-2 py-0.5 rounded text-xs"></span>
+                                <span id="remainBadge" class="px-2 py-0.5 rounded text-xs bg-purple-900/50 text-purple-400 border border-purple-700"></span>
+                                <span id="badge" class="px-2 py-0.5 rounded text-xs"></span>
                             </div>
                         </div>
                         <div class="text-center py-4">
                             <button type="button" id="claimBtn" class="btn-c" onclick="doClaim()">🎰 抽取兑换券</button>
                             <p id="cdMsg" class="text-gray-500 mt-3 text-sm"></p>
                         </div>
-                        <div id="prizeBox" style="display:none" class="text-center py-6">
+                        
+                        <div id="prizeBox" style="display:none" class="text-center py-6 border-t border-gray-800 mt-4">
                             <div class="prize">
-                                <div class="text-gray-400 mb-2">🎉 恭喜获得</div>
-                                <div id="prizeAmount" class="amount-big mb-4"></div>
+                                <div class="text-gray-400 mb-2 text-sm">🎉 恭喜获得</div>
+                                <div id="prizeAmount" class="amount-big mb-3"></div>
                                 <div id="autoRedeemMsg" class="text-green-400 text-sm mb-3" style="display:none">✅ 已自动充值到您的账户</div>
                                 <div id="manualRedeemBox">
-                                    <div class="text-gray-400 text-sm mb-2">兑换码:</div>
-                                    <div id="prizeCode" class="font-mono text-lg bg-gray-800 p-3 rounded-lg border border-gray-700 mb-3"></div>
+                                    <div class="text-gray-400 text-xs mb-1">兑换码:</div>
+                                    <div id="prizeCode" class="font-mono text-sm bg-gray-800 p-2 rounded border border-gray-700 mb-2 break-all"></div>
                                     <button type="button" class="text-blue-400 text-sm hover:underline" onclick="copyPrize()">📋 复制兑换码</button>
-                                    <p class="text-xs text-gray-500 mt-2">请前往 <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400">钱包充值</a> 页面兑换</p>
+                                    <p class="text-xs text-gray-500 mt-2">前往 <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400">钱包充值</a> 兑换</p>
                                 </div>
                             </div>
                         </div>
                     </div>
-                    <div class="card p-6">
-                        <h2 class="font-semibold mb-3">📋 领取记录</h2>
-                        <div id="hist"></div>
+                    
+                    <div class="card p-5">
+                        <h2 class="font-semibold mb-3 text-sm">📋 领取记录</h2>
+                        <div id="hist" class="max-h-60 overflow-y-auto"></div>
                     </div>
                 </div>
-            </div>
-
-            <div class="md:col-span-1">
-                <div id="bigPrizeSection" class="card p-6" style="display:none">
-                    <h2 class="font-semibold mb-4 flex items-center gap-2">🏆 大奖池</h2>
-                    <div id="bigPrizeList"></div>
-                    <p class="text-xs text-gray-500 mt-3">以上大奖等你来抽！</p>
-                </div>
-                <div id="noBigPrize" class="card p-6 text-center text-gray-500">
-                    <div class="text-4xl mb-2">🎰</div>
-                    <p class="text-sm">暂无大奖</p>
+                
+                <div class="md:col-span-1">
+                    <div id="bigPrizeSection" class="card p-5" style="display:none">
+                        <h2 class="font-semibold mb-3 flex items-center gap-2 text-sm">🏆 大奖池</h2>
+                        <div id="bigPrizeList"></div>
+                        <p class="text-xs text-gray-500 mt-3">以上大奖等你来抽！</p>
+                    </div>
+                    <div id="noBigPrize" class="card p-5 text-center text-gray-500">
+                        <div class="text-3xl mb-2">🎰</div>
+                        <p class="text-sm">暂无大奖</p>
+                    </div>
+                    
+                    <div class="card p-5 mt-4">
+                        <h2 class="font-semibold mb-3 text-sm">📊 统计</h2>
+                        <div class="space-y-2 text-sm">
+                            <div class="flex justify-between">
+                                <span class="text-gray-500">可领取</span>
+                                <span id="statAvail" class="text-green-400 font-bold">-</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-500">冷却时间</span>
+                                <span id="statCd" class="text-gray-300">-</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-500">每周期次数</span>
+                                <span id="statTimes" class="text-gray-300">-</span>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
     </main>
 
-    <footer class="text-center py-6 text-gray-600 text-sm">
+    <footer class="text-center py-6 text-gray-600 text-sm px-4">
         每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次 | <a href="/" class="text-blue-400 hover:underline">返回首页</a>
     </footer>
 
     <script>
     var userData = null;
 
-    (function(){
-        var saved = localStorage.getItem('coupon_auth');
-        if(saved){
-            try{
-                var d = JSON.parse(saved);
-                document.getElementById('uid').value = d.user_id || '';
-                document.getElementById('token').value = d.access_token || '';
-            }catch(e){}
-        }
+    document.addEventListener('DOMContentLoaded', function(){
+        checkAuth();
         loadPublicStats();
-    })();
+    });
 
     function loadPublicStats(){
         fetch('/api/stats/public').then(r=>r.json()).then(d=>{
             document.getElementById('cnt').textContent=d.available;
             document.getElementById('cd-text').textContent=d.cooldown_text;
             document.getElementById('claim-times').textContent=d.claim_times;
-            
-            var modeText = d.claim_mode === 'B' ? '🔄 自动充值模式' : '📝 返回兑换码模式';
-            var modeClass = d.claim_mode === 'B' ? 'bg-green-900/50 text-green-400 border border-green-700' : 'bg-blue-900/50 text-blue-400 border border-blue-700';
-            document.getElementById('modeIndicator').innerHTML = '<span class="px-2 py-1 rounded '+modeClass+'">'+modeText+'</span>';
-            
-            renderBigPrizes(d.big_prizes);
+            renderBigPrizes(d.big_prizes, 'bigPrizesLogin');
         }).catch(()=>{});
     }
 
-    function renderBigPrizes(prizes){
-        var section = document.getElementById('bigPrizeSection');
-        var noPrize = document.getElementById('noBigPrize');
-        var list = document.getElementById('bigPrizeList');
+    function checkAuth(){
+        document.getElementById('sec-loading').style.display='block';
+        document.getElementById('sec-login').style.display='none';
+        document.getElementById('sec-claim').style.display='none';
+        
+        fetch('/api/auth/check',{credentials:'include'})
+        .then(r=>r.json())
+        .then(d=>{
+            document.getElementById('sec-loading').style.display='none';
+            if(d.success && d.logged_in){
+                userData = d.data;
+                // 如果返回了 set_cookie，设置本站 cookie
+                if(d.set_cookie){
+                    document.cookie = 'coupon_session=' + d.set_cookie + ';path=/;max-age=' + (7*24*3600) + ';samesite=lax';
+                }
+                showLoggedIn();
+                loadStatus();
+            }else{
+                showLogin();
+            }
+        })
+        .catch(()=>{
+            document.getElementById('sec-loading').style.display='none';
+            showLogin();
+        });
+    }
+
+    function showLogin(){
+        document.getElementById('sec-login').style.display='block';
+        document.getElementById('sec-claim').style.display='none';
+        document.getElementById('navUser').classList.add('hidden');
+        document.getElementById('logoutBtn').classList.add('hidden');
+    }
+
+    function showLoggedIn(){
+        document.getElementById('sec-login').style.display='none';
+        document.getElementById('sec-claim').style.display='block';
+        document.getElementById('uinfo').textContent=userData.username+' (ID:'+userData.user_id+')';
+        document.getElementById('navUser').textContent=userData.username;
+        document.getElementById('navUser').classList.remove('hidden');
+        document.getElementById('logoutBtn').classList.remove('hidden');
+    }
+
+    function doLogout(){
+        fetch('/api/auth/logout',{method:'POST',credentials:'include'})
+        .then(()=>{
+            document.cookie = 'coupon_session=;path=/;max-age=0';
+            userData = null;
+            showLogin();
+            toast('已退出登录',true);
+        });
+    }
+
+    function renderBigPrizes(prizes, containerId){
+        var container = document.getElementById(containerId);
+        if(!container) return;
         
         if(!prizes || prizes.length === 0){
-            section.style.display = 'none';
-            noPrize.style.display = 'block';
+            if(containerId === 'bigPrizesLogin'){
+                container.innerHTML = '';
+            }
             return;
         }
         
-        section.style.display = 'block';
-        noPrize.style.display = 'none';
-        
-        var html = '';
+        var html = '<div class="flex gap-2 flex-wrap justify-center">';
         prizes.forEach(function(p){
-            html += '<div class="bg-gradient-to-r from-yellow-900/50 to-orange-900/50 border border-yellow-700 rounded-lg p-3 mb-2 flex justify-between items-center">';
-            html += '<span class="text-yellow-400 font-bold text-lg">$' + p.quota + '</span>';
-            html += '<span class="bg-yellow-500 text-black px-2 py-1 rounded font-bold text-sm">x' + p.count + '</span>';
-            html += '</div>';
+            html += '<span class="bg-yellow-900/50 text-yellow-400 px-2 py-1 rounded text-xs border border-yellow-700">🏆 $'+p.quota+' x'+p.count+'</span>';
         });
-        list.innerHTML = html;
+        html += '</div>';
+        container.innerHTML = html;
+        
+        if(containerId !== 'bigPrizeList'){
+            var section = document.getElementById('bigPrizeSection');
+            var noPrize = document.getElementById('noBigPrize');
+            var list = document.getElementById('bigPrizeList');
+            
+            if(prizes.length > 0){
+                section.style.display = 'block';
+                noPrize.style.display = 'none';
+                
+                var listHtml = '';
+                prizes.forEach(function(p){
+                    listHtml += '<div class="bg-gradient-to-r from-yellow-900/50 to-orange-900/50 border border-yellow-700 rounded-lg p-2 mb-2 flex justify-between items-center">';
+                    listHtml += '<span class="text-yellow-400 font-bold">$' + p.quota + '</span>';
+                    listHtml += '<span class="bg-yellow-500 text-black px-2 py-0.5 rounded font-bold text-xs">x' + p.count + '</span>';
+                    listHtml += '</div>';
+                });
+                list.innerHTML = listHtml;
+            }else{
+                section.style.display = 'none';
+                noPrize.style.display = 'block';
+            }
+        }
     }
 
     function toast(msg,ok){
@@ -1299,59 +1429,29 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         setTimeout(()=>t.remove(),3000);
     }
 
-    function doVerify(){
-        var uid=document.getElementById('uid').value.trim();
-        var token=document.getElementById('token').value.trim();
-        if(!uid){toast('请填写用户ID',false);return;}
-        if(!token){toast('请填写系统访问令牌',false);return;}
-        var btn=event.target;
-        btn.disabled=true;btn.innerHTML='<span class="ld"></span> 验证中...';
-        fetch('/api/verify',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({user_id:parseInt(uid),access_token:token})
-        }).then(r=>r.json().then(d=>({ok:r.ok,data:d}))).then(({ok,data})=>{
-            btn.disabled=false;btn.textContent='验证身份';
-            if(ok&&data.success){
-                userData={user_id:parseInt(uid),access_token:token,username:data.data.username};
-                localStorage.setItem('coupon_auth',JSON.stringify({user_id:uid,access_token:token}));
-                showLogged();
-                loadStatus();
-                toast('验证成功',true);
-            }else{
-                toast(data.detail||'验证失败',false);
-            }
-        }).catch(()=>{btn.disabled=false;btn.textContent='验证身份';toast('网络错误',false);});
-    }
-
-    function showLogged(){
-        document.getElementById('sec-login').style.display='none';
-        document.getElementById('sec-claim').style.display='block';
-        document.getElementById('uinfo').textContent=userData.username+' (ID:'+userData.user_id+')';
-    }
-
-    function doLogout(){
-        localStorage.removeItem('coupon_auth');
-        userData=null;
-        document.getElementById('sec-login').style.display='block';
-        document.getElementById('sec-claim').style.display='none';
-    }
-
     function loadStatus(){
-        fetch('/api/claim/status',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({user_id:userData.user_id,access_token:userData.access_token})
-        }).then(r=>r.json()).then(res=>{
-            if(res.success){
-                updateUI(res.data);
-                if(res.data.big_prizes) renderBigPrizes(res.data.big_prizes);
+        fetch('/api/claim/status',{credentials:'include'})
+        .then(r=>{
+            if(r.status===401){
+                showLogin();
+                return null;
             }
-        }).catch(()=>{});
+            return r.json();
+        })
+        .then(res=>{
+            if(res && res.success){
+                updateUI(res.data);
+                renderBigPrizes(res.data.big_prizes, 'bigPrizeList');
+            }
+        })
+        .catch(()=>{});
     }
 
     function updateUI(d){
-        document.getElementById('cnt').textContent=d.available_count;
+        document.getElementById('statAvail').textContent=d.available_count;
+        document.getElementById('statCd').textContent=document.getElementById('cd-text').textContent;
+        document.getElementById('statTimes').textContent=d.claim_times+'次';
+        
         var btn=document.getElementById('claimBtn');
         var badge=document.getElementById('badge');
         var remainBadge=document.getElementById('remainBadge');
@@ -1362,28 +1462,32 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         
         if(d.claim_mode === 'B'){
             modeBadge.textContent='🔄 自动充值';
-            modeBadge.className='px-2 py-1 rounded text-xs bg-green-900/50 text-green-400 border border-green-700';
+            modeBadge.className='px-2 py-0.5 rounded text-xs bg-green-900/50 text-green-400 border border-green-700';
         }else{
             modeBadge.textContent='📝 返回兑换码';
-            modeBadge.className='px-2 py-1 rounded text-xs bg-blue-900/50 text-blue-400 border border-blue-700';
+            modeBadge.className='px-2 py-0.5 rounded text-xs bg-blue-900/50 text-blue-400 border border-blue-700';
         }
         
         if(d.can_claim){
             btn.disabled=false;
-            badge.textContent='✅ 可领取';badge.className='px-3 py-1 rounded-full text-sm bg-green-900/50 text-green-400 border border-green-700';
+            badge.textContent='✅ 可领取';
+            badge.className='px-2 py-0.5 rounded text-xs bg-green-900/50 text-green-400 border border-green-700';
             msg.textContent='';
         }else{
             btn.disabled=true;
-            badge.textContent='⏳ 冷却中';badge.className='px-3 py-1 rounded-full text-sm bg-yellow-900/50 text-yellow-400 border border-yellow-700';
+            badge.textContent='⏳ 冷却中';
+            badge.className='px-2 py-0.5 rounded text-xs bg-yellow-900/50 text-yellow-400 border border-yellow-700';
             msg.textContent=d.cooldown_text||'';
         }
+        
         var h=document.getElementById('hist');
-        if(!d.history||d.history.length===0){h.innerHTML='<p class="text-gray-500 text-center text-sm">暂无记录</p>';}
-        else{
+        if(!d.history||d.history.length===0){
+            h.innerHTML='<p class="text-gray-500 text-center text-sm">暂无记录</p>';
+        }else{
             var html='';
             d.history.forEach(r=>{
-                var statusText=r.auto_redeemed?'<span class="text-green-400 text-xs ml-2">[已自动充值]</span>':'';
-                html+='<div class="cpn text-white"><div class="flex justify-between items-center"><span class="font-mono text-sm">'+r.coupon_code+'</span><span class="bg-white/20 px-2 py-0.5 rounded text-sm">$'+r.quota+'</span></div><div class="flex justify-between items-center mt-1"><span class="text-xs text-blue-200">'+new Date(r.claim_time).toLocaleString('zh-CN')+'</span>'+statusText+'</div></div>';
+                var statusText=r.auto_redeemed?'<span class="text-green-400 text-xs ml-1">[已充值]</span>':'';
+                html+='<div class="cpn text-white text-sm"><div class="flex justify-between items-center"><span class="font-mono text-xs truncate flex-1 mr-2">'+r.coupon_code+'</span><span class="bg-white/20 px-2 py-0.5 rounded text-xs shrink-0">$'+r.quota+'</span></div><div class="flex justify-between items-center mt-1"><span class="text-xs text-blue-200">'+new Date(r.claim_time).toLocaleString('zh-CN')+'</span>'+statusText+'</div></div>';
             });
             h.innerHTML=html;
         }
@@ -1391,23 +1495,38 @@ CLAIM_PAGE = '''<!DOCTYPE html>
 
     function doClaim(){
         var btn=document.getElementById('claimBtn');
-        btn.disabled=true;btn.innerHTML='<span class="ld"></span> 抽取中...';
+        btn.disabled=true;
+        btn.innerHTML='<span class="ld"></span> 抽取中...';
         document.getElementById('prizeBox').style.display='none';
+        
         fetch('/api/claim',{
             method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({user_id:userData.user_id,access_token:userData.access_token})
-        }).then(r=>r.json().then(d=>({ok:r.ok,data:d}))).then(({ok,data})=>{
+            credentials:'include',
+            headers:{'Content-Type':'application/json'}
+        })
+        .then(r=>{
+            if(r.status===401){
+                showLogin();
+                toast('请先登录',false);
+                return null;
+            }
+            return r.json().then(d=>({ok:r.ok,data:d}));
+        })
+        .then(result=>{
+            if(!result) return;
+            var {ok,data}=result;
             btn.innerHTML='🎰 抽取兑换券';
+            
             if(ok&&data.success){
                 var d=data.data;
                 document.getElementById('prizeAmount').textContent='$'+d.quota;
                 document.getElementById('prizeCode').textContent=d.coupon_code;
                 document.getElementById('prizeBox').style.display='block';
+                
                 if(d.auto_redeemed){
                     document.getElementById('autoRedeemMsg').style.display='block';
                     document.getElementById('manualRedeemBox').style.display='none';
-                    toast('恭喜获得 $'+d.quota+'！已自动充值到账户',true);
+                    toast('恭喜获得 $'+d.quota+'！已自动充值',true);
                 }else{
                     document.getElementById('autoRedeemMsg').style.display='none';
                     document.getElementById('manualRedeemBox').style.display='block';
@@ -1419,7 +1538,12 @@ CLAIM_PAGE = '''<!DOCTYPE html>
             }
             loadStatus();
             loadPublicStats();
-        }).catch(()=>{btn.innerHTML='🎰 抽取兑换券';toast('网络错误',false);loadStatus();});
+        })
+        .catch(()=>{
+            btn.innerHTML='🎰 抽取兑换券';
+            toast('网络错误',false);
+            loadStatus();
+        });
     }
 
     function copyPrize(){
@@ -1440,32 +1564,33 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     <style>
         body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui,sans-serif}
         .card{background:#12121a;border:1px solid #1f1f2e;border-radius:12px}
-        .ipt{background:#0d0d12;border:1px solid #1f1f2e;color:#e0e0e0;border-radius:8px;padding:10px 14px;width:100%}
+        .ipt{background:#0d0d12;border:1px solid #1f1f2e;color:#e0e0e0;border-radius:8px;padding:10px 14px;width:100%;font-size:14px}
         .ipt:focus{border-color:#3b82f6;outline:none}
-        .btn{padding:10px 20px;border-radius:8px;font-weight:600;border:none;cursor:pointer}
+        .btn{padding:8px 16px;border-radius:8px;font-weight:600;border:none;cursor:pointer;font-size:13px}
         .btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
         .btn-green{background:#10b981;color:#fff}.btn-green:hover{background:#059669}
         .btn-purple{background:#8b5cf6;color:#fff}.btn-purple:hover{background:#7c3aed}
         .btn-red{background:#ef4444;color:#fff}.btn-red:hover{background:#dc2626}
         .btn-gray{background:#374151;color:#fff}.btn-gray:hover{background:#4b5563}
         #overlay{position:fixed;inset:0;background:rgba(0,0,0,0.95);display:flex;align-items:center;justify-content:center;z-index:100}
-        #toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:8px;color:#fff;z-index:200;display:none}
-        .tab-btn{padding:8px 16px;border-radius:8px;cursor:pointer;transition:all .2s}
+        #toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);padding:10px 20px;border-radius:8px;color:#fff;z-index:200;display:none;font-size:14px}
+        .tab-btn{padding:6px 12px;border-radius:8px;cursor:pointer;transition:all .2s;font-size:13px}
         .tab-btn.active{background:#3b82f6;color:#fff}
         .tab-btn:not(.active){background:#1f1f2e;color:#9ca3af}
-        .coupon-row{display:grid;grid-template-columns:1fr 80px 80px 120px 80px;gap:8px;padding:10px;border-bottom:1px solid #1f1f2e;align-items:center}
-        .weight-row{display:flex;align-items:center;gap:8px;padding:10px;background:#1a1a24;border-radius:8px;margin-bottom:8px}
-        .switch{position:relative;width:50px;height:26px;background:#374151;border-radius:13px;cursor:pointer;transition:background .3s}
+        .coupon-row{display:grid;grid-template-columns:1fr 60px 60px 100px 60px;gap:6px;padding:8px;border-bottom:1px solid #1f1f2e;align-items:center;font-size:12px}
+        @media(max-width:640px){.coupon-row{grid-template-columns:1fr 50px 50px;}.coupon-row>div:nth-child(4),.coupon-row>div:nth-child(5){display:none}}
+        .weight-row{display:flex;align-items:center;gap:6px;padding:8px;background:#1a1a24;border-radius:8px;margin-bottom:6px;flex-wrap:wrap}
+        .switch{position:relative;width:44px;height:24px;background:#374151;border-radius:12px;cursor:pointer;transition:background .3s;flex-shrink:0}
         .switch.on{background:#10b981}
-        .switch::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;background:#fff;border-radius:50%;transition:left .3s}
-        .switch.on::after{left:27px}
-        .prob-bar{height:8px;background:#1f1f2e;border-radius:4px;overflow:hidden}
-        .prob-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#10b981);border-radius:4px}
+        .switch::after{content:'';position:absolute;top:2px;left:2px;width:20px;height:20px;background:#fff;border-radius:50%;transition:left .3s}
+        .switch.on::after{left:22px}
+        .prob-bar{height:6px;background:#1f1f2e;border-radius:3px;overflow:hidden}
+        .prob-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#10b981);border-radius:3px}
     </style>
 </head>
 <body class="min-h-screen">
     <div id="overlay">
-        <div class="card p-8 w-full max-w-sm mx-4">
+        <div class="card p-6 w-full max-w-sm mx-4">
             <div class="text-center mb-6"><div class="text-4xl mb-2">🔐</div><h1 class="text-xl font-bold">管理后台</h1></div>
             <input type="password" id="loginPwd" class="ipt mb-4" placeholder="管理员密码">
             <button class="btn btn-blue w-full" onclick="doLogin()">登录</button>
@@ -1475,162 +1600,149 @@ ADMIN_PAGE = '''<!DOCTYPE html>
     </div>
 
     <div id="adminMain" style="display:none">
-        <nav class="border-b border-gray-800 py-4 px-6">
-            <div class="max-w-7xl mx-auto flex justify-between items-center">
-                <h1 class="font-bold text-xl">🔧 管理后台</h1>
-                <div class="flex items-center gap-4">
-                    <span id="currentModeNav" class="text-sm"></span>
-                    <span id="currentProbModeNav" class="text-sm"></span>
-                    <a href="/" class="text-gray-400 hover:text-white text-sm">← 首页</a>
+        <nav class="border-b border-gray-800 py-3 px-4 sticky top-0 bg-[#0a0a0f]/95 backdrop-blur z-50">
+            <div class="max-w-6xl mx-auto flex flex-wrap justify-between items-center gap-2">
+                <h1 class="font-bold text-lg">🔧 管理后台</h1>
+                <div class="flex items-center gap-2 flex-wrap">
+                    <span id="currentModeNav" class="text-xs"></span>
+                    <a href="/" class="text-gray-400 hover:text-white text-sm">首页</a>
                     <button class="text-red-400 text-sm" onclick="doLogout()">退出</button>
                 </div>
             </div>
         </nav>
 
-        <div class="max-w-7xl mx-auto px-4 py-4">
-            <div class="flex gap-2 flex-wrap">
+        <div class="max-w-6xl mx-auto px-4 py-3">
+            <div class="flex gap-2 flex-wrap overflow-x-auto">
                 <button class="tab-btn active" onclick="switchTab('overview')">📊 总览</button>
-                <button class="tab-btn" onclick="switchTab('coupons')">🎫 兑换码管理</button>
-                <button class="tab-btn" onclick="switchTab('add')">➕ 添加兑换码</button>
-                <button class="tab-btn" onclick="switchTab('config')">⚙️ 系统配置</button>
+                <button class="tab-btn" onclick="switchTab('coupons')">🎫 兑换码</button>
+                <button class="tab-btn" onclick="switchTab('add')">➕ 添加</button>
+                <button class="tab-btn" onclick="switchTab('config')">⚙️ 配置</button>
             </div>
         </div>
 
-        <main class="max-w-7xl mx-auto px-4 pb-8">
+        <main class="max-w-6xl mx-auto px-4 pb-8">
             <div id="tab-overview" class="tab-content">
-                <div class="grid lg:grid-cols-3 gap-6">
-                    <div class="lg:col-span-2"><div class="card p-6"><h2 class="font-semibold mb-4">📊 统计数据</h2><div id="statsBox">加载中...</div></div></div>
-                    <div><div class="card p-6"><h2 class="font-semibold mb-4">📋 最近领取</h2><div id="recentBox" class="max-h-96 overflow-y-auto space-y-2 text-sm"></div></div></div>
+                <div class="grid lg:grid-cols-3 gap-4">
+                    <div class="lg:col-span-2"><div class="card p-5"><h2 class="font-semibold mb-4 text-sm">📊 统计数据</h2><div id="statsBox">加载中...</div></div></div>
+                    <div><div class="card p-5"><h2 class="font-semibold mb-4 text-sm">📋 最近领取</h2><div id="recentBox" class="max-h-80 overflow-y-auto space-y-2 text-xs"></div></div></div>
                 </div>
             </div>
 
             <div id="tab-coupons" class="tab-content" style="display:none">
-                <div class="card p-6">
-                    <div class="flex flex-wrap justify-between items-center gap-4 mb-4">
-                        <h2 class="font-semibold">🎫 本地兑换码列表</h2>
+                <div class="card p-5">
+                    <div class="flex flex-wrap justify-between items-center gap-3 mb-4">
+                        <h2 class="font-semibold text-sm">🎫 本地兑换码</h2>
                         <div class="flex gap-2 flex-wrap">
-                            <select id="couponStatus" class="ipt w-auto" onchange="loadCoupons(1)">
+                            <select id="couponStatus" class="ipt w-auto text-sm py-2" onchange="loadCoupons(1)">
                                 <option value="all">全部</option>
                                 <option value="available">可用</option>
-                                <option value="claimed">已领取</option>
+                                <option value="claimed">已领</option>
                             </select>
-                            <input type="text" id="couponSearch" class="ipt w-40" placeholder="搜索..." onkeyup="if(event.key==='Enter')loadCoupons(1)">
+                            <input type="text" id="couponSearch" class="ipt w-32 text-sm py-2" placeholder="搜索..." onkeyup="if(event.key==='Enter')loadCoupons(1)">
                             <button class="btn btn-blue" onclick="loadCoupons(1)">搜索</button>
                         </div>
                     </div>
-                    <div class="flex gap-2 mb-4 flex-wrap">
-                        <button class="btn btn-gray text-sm" onclick="selectAllCoupons()">全选当页</button>
-                        <button class="btn btn-red text-sm" onclick="deleteSelected()">删除选中</button>
-                        <button class="btn btn-red text-sm" onclick="deleteBatch('all_claimed')">删除已领取</button>
+                    <div class="flex gap-2 mb-3 flex-wrap">
+                        <button class="btn btn-gray text-xs" onclick="selectAllCoupons()">全选</button>
+                        <button class="btn btn-red text-xs" onclick="deleteSelected()">删除选中</button>
+                        <button class="btn btn-red text-xs" onclick="deleteBatch('all_claimed')">删除已领</button>
                     </div>
-                    <div class="coupon-row text-gray-500 text-sm font-semibold border-b-2 border-gray-700">
-                        <div class="flex items-center gap-2"><input type="checkbox" id="selectAllCheck" onchange="toggleSelectAll()"> 兑换码</div>
+                    <div class="coupon-row text-gray-500 font-semibold border-b-2 border-gray-700">
+                        <div class="flex items-center gap-1"><input type="checkbox" id="selectAllCheck" onchange="toggleSelectAll()"> 兑换码</div>
                         <div>额度</div>
                         <div>状态</div>
                         <div>领取信息</div>
                         <div>操作</div>
                     </div>
                     <div id="couponList"></div>
-                    <div id="pagination" class="flex justify-center gap-2 mt-4"></div>
+                    <div id="pagination" class="flex justify-center gap-1 mt-4 flex-wrap"></div>
                 </div>
             </div>
 
             <div id="tab-add" class="tab-content" style="display:none">
-                <div class="card p-6">
-                    <h2 class="font-semibold mb-4">➕ 添加本地兑换码</h2>
-                    <p class="text-sm text-gray-500 mb-4">本地兑换码在A模式下优先使用</p>
+                <div class="card p-5">
+                    <h2 class="font-semibold mb-4 text-sm">➕ 添加本地兑换码</h2>
                     <div class="grid grid-cols-5 gap-2 mb-4">
-                        <button onclick="setQuota(1)" class="bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold hover:opacity-80">$1</button>
-                        <button onclick="setQuota(2)" class="bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold hover:opacity-80">$2</button>
-                        <button onclick="setQuota(5)" class="bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold hover:opacity-80">$5</button>
-                        <button onclick="setQuota(10)" class="bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold hover:opacity-80">$10</button>
-                        <button onclick="setQuota(20)" class="bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold hover:opacity-80">$20</button>
+                        <button onclick="setQuota(1)" class="bg-green-900/50 text-green-400 border border-green-700 py-2 rounded font-bold text-sm hover:opacity-80">$1</button>
+                        <button onclick="setQuota(2)" class="bg-blue-900/50 text-blue-400 border border-blue-700 py-2 rounded font-bold text-sm hover:opacity-80">$2</button>
+                        <button onclick="setQuota(5)" class="bg-purple-900/50 text-purple-400 border border-purple-700 py-2 rounded font-bold text-sm hover:opacity-80">$5</button>
+                        <button onclick="setQuota(10)" class="bg-orange-900/50 text-orange-400 border border-orange-700 py-2 rounded font-bold text-sm hover:opacity-80">$10</button>
+                        <button onclick="setQuota(20)" class="bg-red-900/50 text-red-400 border border-red-700 py-2 rounded font-bold text-sm hover:opacity-80">$20</button>
                     </div>
                     <div class="flex items-center gap-2 mb-4">
-                        <span class="text-gray-400">额度:</span>
-                        <input type="number" id="quotaVal" value="1" step="0.01" min="0.01" class="w-24 ipt text-center font-bold">
-                        <span class="text-gray-400">美元</span>
+                        <span class="text-gray-400 text-sm">额度:</span>
+                        <input type="number" id="quotaVal" value="1" step="0.01" min="0.01" class="w-20 ipt text-center font-bold text-sm">
+                        <span class="text-gray-400 text-sm">美元</span>
                     </div>
                     <div class="mb-4">
                         <label class="block text-sm text-gray-400 mb-2">上传TXT文件</label>
-                        <input type="file" id="txtFile" accept=".txt" class="ipt">
+                        <input type="file" id="txtFile" accept=".txt" class="ipt text-sm">
                     </div>
                     <button class="btn btn-blue w-full mb-4" onclick="doUpload()">上传文件</button>
                     <hr class="border-gray-700 my-4">
                     <div>
                         <label class="block text-sm text-gray-400 mb-2">或手动粘贴（每行一个）</label>
-                        <textarea id="codesText" rows="6" class="ipt font-mono text-sm" placeholder="每行一个兑换码"></textarea>
+                        <textarea id="codesText" rows="5" class="ipt font-mono text-sm" placeholder="每行一个兑换码"></textarea>
                     </div>
                     <button class="btn btn-green w-full mt-3" onclick="doAddCodes()">添加兑换码</button>
                 </div>
             </div>
 
             <div id="tab-config" class="tab-content" style="display:none">
-                <div class="grid lg:grid-cols-2 gap-6">
-                    <div class="card p-6">
-                        <h2 class="font-semibold mb-4">🎯 模式设置</h2>
-                        <div class="space-y-4">
-                            <div class="flex items-center justify-between p-4 bg-gray-800/50 rounded-lg">
-                                <div>
-                                    <p class="font-semibold">自动充值模式 (B模式)</p>
-                                    <p class="text-xs text-gray-500">开启后额度直接充值到用户账户</p>
+                <div class="grid lg:grid-cols-2 gap-4">
+                    <div class="card p-5">
+                        <h2 class="font-semibold mb-4 text-sm">🎯 模式设置</h2>
+                        <div class="space-y-3">
+                            <div class="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+                                <div class="flex-1 min-w-0">
+                                    <p class="font-semibold text-sm">自动充值模式 (B)</p>
+                                    <p class="text-xs text-gray-500">开启后额度直接充值</p>
                                 </div>
                                 <div id="modeSwitch" class="switch" onclick="toggleMode()"></div>
                             </div>
-                            <div id="modeDesc" class="text-sm text-gray-400 p-3 bg-blue-900/20 border border-blue-800 rounded"></div>
+                            <div id="modeDesc" class="text-xs text-gray-400 p-2 bg-blue-900/20 border border-blue-800 rounded"></div>
                             
-                            <div class="flex items-center justify-between p-4 bg-gray-800/50 rounded-lg">
-                                <div>
-                                    <p class="font-semibold">概率计算: 权重×库存</p>
-                                    <p class="text-xs text-gray-500">关闭则仅按权重计算概率</p>
+                            <div class="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+                                <div class="flex-1 min-w-0">
+                                    <p class="font-semibold text-sm">概率: 权重×库存</p>
+                                    <p class="text-xs text-gray-500">关闭则仅按权重</p>
                                 </div>
                                 <div id="probModeSwitch" class="switch" onclick="toggleProbMode()"></div>
                             </div>
-                            <div id="probModeDesc" class="text-sm text-gray-400 p-3 bg-purple-900/20 border border-purple-800 rounded"></div>
                             
-                            <div class="p-3 bg-yellow-900/20 border border-yellow-800 rounded">
-                                <p class="text-sm text-yellow-400">⚠️ 需要配置 ADMIN_ACCESS_TOKEN</p>
-                                <p id="tokenStatus" class="text-xs mt-1"></p>
+                            <div class="p-2 bg-yellow-900/20 border border-yellow-800 rounded">
+                                <p id="tokenStatus" class="text-xs"></p>
                             </div>
                         </div>
                     </div>
 
-                    <div class="card p-6">
-                        <h2 class="font-semibold mb-4">📊 额度比例</h2>
-                        <div class="space-y-4">
+                    <div class="card p-5">
+                        <h2 class="font-semibold mb-4 text-sm">📊 额度比例 & 冷却</h2>
+                        <div class="space-y-3">
                             <div>
-                                <label class="block text-sm text-gray-400 mb-2">$1 = ? quota</label>
-                                <input type="number" id="quotaRate" min="1" class="w-full ipt">
-                                <p class="text-xs text-gray-500 mt-1">默认 500000</p>
+                                <label class="block text-xs text-gray-400 mb-1">$1 = ? quota</label>
+                                <input type="number" id="quotaRate" min="1" class="w-full ipt text-sm">
                             </div>
-                            <button class="btn btn-blue w-full" onclick="saveQuotaRate()">保存</button>
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">冷却时间（分钟）</label>
+                                <input type="number" id="cooldownMinutes" min="1" class="w-full ipt text-sm">
+                            </div>
+                            <div>
+                                <label class="block text-xs text-gray-400 mb-1">每周期可领次数</label>
+                                <input type="number" id="claimTimes" min="1" class="w-full ipt text-sm">
+                            </div>
+                            <button class="btn btn-blue w-full" onclick="saveBasicConfig()">保存</button>
                         </div>
                     </div>
 
-                    <div class="card p-6">
-                        <h2 class="font-semibold mb-4">⏱️ 冷却时间</h2>
-                        <div class="space-y-4">
-                            <div>
-                                <label class="block text-sm text-gray-400 mb-2">冷却时间（分钟）</label>
-                                <input type="number" id="cooldownMinutes" min="1" class="w-full ipt">
-                            </div>
-                            <div>
-                                <label class="block text-sm text-gray-400 mb-2">每周期可领取次数</label>
-                                <input type="number" id="claimTimes" min="1" class="w-full ipt">
-                            </div>
-                            <button class="btn btn-blue w-full" onclick="saveCooldownConfig()">保存</button>
-                        </div>
-                    </div>
-
-                    <div class="card p-6">
-                        <h2 class="font-semibold mb-4">🎰 概率权重 & 虚拟库存</h2>
-                        <div id="probModeHint" class="p-3 bg-green-900/20 border border-green-800 rounded mb-4"></div>
-                        <div id="weightsContainer" class="max-h-80 overflow-y-auto mb-4"></div>
+                    <div class="card p-5 lg:col-span-2">
+                        <h2 class="font-semibold mb-4 text-sm">🎰 概率权重 & 虚拟库存</h2>
+                        <div id="weightsContainer" class="max-h-64 overflow-y-auto mb-4"></div>
                         <div class="flex gap-2 mb-4 flex-wrap">
-                            <input type="number" id="newQuotaKey" step="0.01" placeholder="额度" class="w-16 ipt text-center text-sm">
-                            <input type="number" id="newQuotaWeight" step="0.01" placeholder="权重" class="w-16 ipt text-center text-sm">
-                            <input type="number" id="newQuotaStock" placeholder="库存" class="w-16 ipt text-center text-sm">
-                            <button class="btn btn-green text-sm" onclick="addWeight()">添加</button>
+                            <input type="number" id="newQuotaKey" step="0.01" placeholder="额度" class="w-16 ipt text-center text-sm py-2">
+                            <input type="number" id="newQuotaWeight" step="0.01" placeholder="权重" class="w-16 ipt text-center text-sm py-2">
+                            <input type="number" id="newQuotaStock" placeholder="库存" class="w-16 ipt text-center text-sm py-2">
+                            <button class="btn btn-green" onclick="addWeight()">添加</button>
                         </div>
                         <button class="btn btn-purple w-full" onclick="saveWeightsAndStock()">保存配置</button>
                     </div>
@@ -1706,18 +1818,17 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         var html='';
         data.coupons.forEach(function(c){
             var statusClass=c.is_claimed?'text-gray-500':'text-green-400';
-            var statusText=c.is_claimed?'已领取':'可用';
-            var sourceTag=c.source==='api'?'<span class="text-xs text-purple-400 ml-1">[API]</span>':'';
+            var statusText=c.is_claimed?'已领':'可用';
             html+='<div class="coupon-row">';
-            html+='<div class="flex items-center gap-2"><input type="checkbox" data-id="'+c.id+'" onchange="toggleSelect('+c.id+')"><span class="font-mono text-sm truncate">'+c.code+'</span>'+sourceTag+'</div>';
+            html+='<div class="flex items-center gap-1 min-w-0"><input type="checkbox" data-id="'+c.id+'" onchange="toggleSelect('+c.id+')"><span class="font-mono truncate">'+c.code+'</span></div>';
             html+='<div class="text-blue-400 font-bold">$'+c.quota+'</div>';
             html+='<div class="'+statusClass+'">'+statusText+'</div>';
-            html+='<div class="text-xs text-gray-500">'+(c.claimed_by?c.claimed_by+'<br>'+c.claimed_at:'-')+'</div>';
-            html+='<div><button class="text-red-400 hover:text-red-300 text-sm" onclick="deleteCoupon('+c.id+')">删除</button></div>';
+            html+='<div class="text-gray-500 truncate">'+(c.claimed_by||'-')+'</div>';
+            html+='<div><button class="text-red-400 hover:text-red-300" onclick="deleteCoupon('+c.id+')">删</button></div>';
             html+='</div>';
         });
-        document.getElementById('couponList').innerHTML=html||'<p class="text-gray-500 text-center py-4">暂无数据</p>';
-        var phtml='';for(var i=1;i<=data.pages;i++){phtml+='<button class="px-3 py-1 rounded '+(i===data.page?'bg-blue-600':'bg-gray-700')+'" onclick="loadCoupons('+i+')">'+i+'</button>';}
+        document.getElementById('couponList').innerHTML=html||'<p class="text-gray-500 text-center py-4 text-sm">暂无数据</p>';
+        var phtml='';for(var i=1;i<=data.pages;i++){phtml+='<button class="px-2 py-1 rounded text-xs '+(i===data.page?'bg-blue-600':'bg-gray-700')+'" onclick="loadCoupons('+i+')">'+i+'</button>';}
         document.getElementById('pagination').innerHTML=phtml;
     }
 
@@ -1737,9 +1848,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         for(var k in stock)currentStock[k]=stock[k];
         
         var probMap = {};
-        if(probInfo){
-            probInfo.forEach(function(p){ probMap[p.quota] = p.probability; });
-        }
+        if(probInfo){probInfo.forEach(function(p){ probMap[p.quota] = p.probability; });}
         
         var allKeys = new Set([...Object.keys(currentWeights), ...Object.keys(currentStock)]);
         var sortedKeys = Array.from(allKeys).sort((a,b)=>parseFloat(a)-parseFloat(b));
@@ -1754,16 +1863,16 @@ ADMIN_PAGE = '''<!DOCTYPE html>
             var stockClass = stockVal <= 0 ? 'border-red-500 bg-red-900/20' : '';
             
             html+='<div class="weight-row '+rowClass+'">';
-            html+='<div class="flex items-center gap-2 w-20">';
-            if(isBigPrize) html+='<span class="text-yellow-400">🏆</span>';
-            html+='<span class="text-blue-400 font-bold">$'+k+'</span></div>';
-            html+='<div class="flex items-center gap-1"><input type="number" step="0.01" min="0" value="'+weight+'" onchange="updateWeight(\\''+k+'\\', this.value)" class="w-14 ipt text-center text-sm p-1" title="权重"><span class="text-gray-500 text-xs">权</span></div>';
-            html+='<div class="flex items-center gap-1"><input type="number" min="0" value="'+stockVal+'" onchange="updateStock(\\''+k+'\\', this.value)" class="w-14 ipt text-center text-sm p-1 '+stockClass+'" title="库存"><span class="text-gray-500 text-xs">存</span></div>';
-            html+='<div class="flex-1 mx-2"><div class="prob-bar"><div class="prob-fill" style="width:'+Math.min(prob,100)+'%"></div></div><span class="text-xs text-gray-400">'+prob.toFixed(1)+'%</span></div>';
+            html+='<div class="flex items-center gap-1 w-16">';
+            if(isBigPrize) html+='<span class="text-yellow-400 text-xs">🏆</span>';
+            html+='<span class="text-blue-400 font-bold text-sm">$'+k+'</span></div>';
+            html+='<input type="number" step="0.01" min="0" value="'+weight+'" onchange="updateWeight(\\''+k+'\\', this.value)" class="w-14 ipt text-center text-xs p-1" title="权重">';
+            html+='<input type="number" min="0" value="'+stockVal+'" onchange="updateStock(\\''+k+'\\', this.value)" class="w-14 ipt text-center text-xs p-1 '+stockClass+'" title="库存">';
+            html+='<div class="flex-1 min-w-20"><div class="prob-bar"><div class="prob-fill" style="width:'+Math.min(prob,100)+'%"></div></div><span class="text-xs text-gray-400">'+prob.toFixed(1)+'%</span></div>';
             html+='<button onclick="removeQuota(\\''+k+'\\')" class="text-red-400 text-sm">✕</button>';
             html+='</div>';
         });
-        document.getElementById('weightsContainer').innerHTML=html||'<p class="text-gray-500">暂无配置</p>';
+        document.getElementById('weightsContainer').innerHTML=html||'<p class="text-gray-500 text-sm">暂无配置</p>';
     }
 
     function updateWeight(key,val){currentWeights[key]=parseFloat(val)||0;}
@@ -1787,20 +1896,14 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         currentMode=currentMode==='A'?'B':'A';
         updateModeUI();
         fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,claim_mode:currentMode})})
-        .then(r=>r.json()).then(d=>{
-            toast(d.message,d.success);
-            loadStats();
-        });
+        .then(r=>r.json()).then(d=>{toast(d.message,d.success);loadStats();});
     }
 
     function toggleProbMode(){
         currentProbMode=currentProbMode==='weight_only'?'weight_stock':'weight_only';
         updateProbModeUI();
         fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,probability_mode:currentProbMode})})
-        .then(r=>r.json()).then(d=>{
-            toast(d.message,d.success);
-            loadStats();
-        });
+        .then(r=>r.json()).then(d=>{toast(d.message,d.success);loadStats();});
     }
 
     function updateModeUI(){
@@ -1809,42 +1912,25 @@ ADMIN_PAGE = '''<!DOCTYPE html>
         var nav=document.getElementById('currentModeNav');
         if(currentMode==='B'){
             sw.classList.add('on');
-            desc.innerHTML='<b class="text-green-400">模式B（自动充值）</b>：调用API创建兑换码并自动充值';
-            nav.innerHTML='<span class="bg-green-900/50 text-green-400 px-2 py-1 rounded text-xs">🔄 自动充值</span>';
+            desc.innerHTML='<b class="text-green-400">模式B</b>：自动充值到用户账户';
+            nav.innerHTML='<span class="bg-green-900/50 text-green-400 px-2 py-0.5 rounded text-xs">🔄 自动充值</span>';
         }else{
             sw.classList.remove('on');
-            desc.innerHTML='<b class="text-blue-400">模式A（返回兑换码）</b>：优先本地兑换码，用户需自行兑换';
-            nav.innerHTML='<span class="bg-blue-900/50 text-blue-400 px-2 py-1 rounded text-xs">📝 返回兑换码</span>';
+            desc.innerHTML='<b class="text-blue-400">模式A</b>：返回兑换码，用户自行兑换';
+            nav.innerHTML='<span class="bg-blue-900/50 text-blue-400 px-2 py-0.5 rounded text-xs">📝 返回兑换码</span>';
         }
     }
 
     function updateProbModeUI(){
         var sw=document.getElementById('probModeSwitch');
-        var desc=document.getElementById('probModeDesc');
-        var nav=document.getElementById('currentProbModeNav');
-        var hint=document.getElementById('probModeHint');
-        if(currentProbMode==='weight_stock'){
-            sw.classList.add('on');
-            desc.innerHTML='<b class="text-green-400">权重×库存</b>：概率 = 权重 × 库存 / 总和<br><span class="text-xs">库存越多概率越高</span>';
-            nav.innerHTML='<span class="bg-purple-900/50 text-purple-400 px-2 py-1 rounded text-xs">📊 权重×库存</span>';
-            hint.innerHTML='<p class="text-sm text-green-400">📐 当前公式: 概率 = 权重 × 库存 / Σ(权重×库存)</p>';
-        }else{
-            sw.classList.remove('on');
-            desc.innerHTML='<b class="text-blue-400">仅权重</b>：概率 = 权重 / 总权重<br><span class="text-xs">库存只决定能否抽中</span>';
-            nav.innerHTML='<span class="bg-blue-900/50 text-blue-400 px-2 py-1 rounded text-xs">⚖️ 仅权重</span>';
-            hint.innerHTML='<p class="text-sm text-blue-400">📐 当前公式: 概率 = 权重 / Σ权重</p>';
-        }
+        if(currentProbMode==='weight_stock'){sw.classList.add('on');}else{sw.classList.remove('on');}
     }
 
-    function saveCooldownConfig(){
+    function saveBasicConfig(){
         var minutes=parseInt(document.getElementById('cooldownMinutes').value);
         var times=parseInt(document.getElementById('claimTimes').value);
-        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,cooldown_minutes:minutes,claim_times:times})}).then(r=>r.json()).then(d=>toast(d.message,d.success));
-    }
-
-    function saveQuotaRate(){
         var rate=parseInt(document.getElementById('quotaRate').value);
-        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,quota_rate:rate})}).then(r=>r.json()).then(d=>toast(d.message,d.success));
+        fetch('/api/admin/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:adminPwd,cooldown_minutes:minutes,claim_times:times,quota_rate:rate})}).then(r=>r.json()).then(d=>toast(d.message,d.success));
     }
 
     function saveWeightsAndStock(){
@@ -1864,32 +1950,29 @@ ADMIN_PAGE = '''<!DOCTYPE html>
             renderWeightsAndStock(d.quota_weights, d.quota_stock, d.probability_info);
             
             var tokenStatus=document.getElementById('tokenStatus');
-            tokenStatus.textContent=d.admin_token_configured?'✅ 已配置管理员令牌':'❌ 未配置管理员令牌';
-            tokenStatus.className='text-xs mt-1 '+(d.admin_token_configured?'text-green-400':'text-red-400');
+            tokenStatus.textContent=d.admin_token_configured?'✅ 管理员令牌已配置':'❌ 未配置管理员令牌';
+            tokenStatus.className='text-xs '+(d.admin_token_configured?'text-green-400':'text-red-400');
             
-            var h='<div class="grid grid-cols-3 gap-4 mb-6">';
-            h+='<div class="bg-gray-800 p-4 rounded-lg text-center"><div class="text-2xl font-bold">'+d.total+'</div><div class="text-gray-500 text-sm">本地总数</div></div>';
-            h+='<div class="bg-green-900/30 p-4 rounded-lg text-center border border-green-800"><div class="text-2xl font-bold text-green-400">'+d.total_virtual_stock+'</div><div class="text-gray-500 text-sm">可抽取总库存</div></div>';
-            h+='<div class="bg-blue-900/30 p-4 rounded-lg text-center border border-blue-800"><div class="text-2xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-gray-500 text-sm">已领取</div></div>';
+            var h='<div class="grid grid-cols-3 gap-3 mb-4">';
+            h+='<div class="bg-gray-800 p-3 rounded-lg text-center"><div class="text-xl font-bold">'+d.total+'</div><div class="text-gray-500 text-xs">本地总数</div></div>';
+            h+='<div class="bg-green-900/30 p-3 rounded-lg text-center border border-green-800"><div class="text-xl font-bold text-green-400">'+d.total_virtual_stock+'</div><div class="text-gray-500 text-xs">可抽库存</div></div>';
+            h+='<div class="bg-blue-900/30 p-3 rounded-lg text-center border border-blue-800"><div class="text-xl font-bold text-blue-400">'+d.claimed+'</div><div class="text-gray-500 text-xs">已领取</div></div>';
             h+='</div>';
             
             if(d.probability_info && d.probability_info.length > 0){
-                var probModeText = currentProbMode === 'weight_stock' ? '权重×库存' : '仅权重';
-                h+='<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">📊 实际概率分布 ('+probModeText+')</h3><div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2">';
+                h+='<div class="mb-3"><h3 class="text-xs font-semibold text-gray-400 mb-2">📊 概率分布</h3><div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2">';
                 d.probability_info.forEach(function(p){
                     var colorClass = p.stock > 0 ? 'bg-green-900/30 border-green-800 text-green-400' : 'bg-red-900/30 border-red-800 text-red-400';
-                    var isBig = parseFloat(p.quota) >= d.big_prize_threshold;
-                    h+='<div class="'+colorClass+' border rounded p-2 text-center">';
-                    if(isBig) h+='<span class="text-yellow-400">🏆</span> ';
+                    h+='<div class="'+colorClass+' border rounded p-2 text-center text-xs">';
                     h+='<span class="font-bold">$'+p.quota+'</span><br>';
-                    h+='<span class="text-xs">库存:'+p.stock+' | '+p.probability+'%</span></div>';
+                    h+='<span>库存:'+p.stock+' | '+p.probability+'%</span></div>';
                 });
                 h+='</div></div>';
             }
             
             document.getElementById('statsBox').innerHTML=h;
             
-            var rh='';d.recent_claims.forEach(c=>{var autoTag=c.auto_redeemed?'<span class="text-green-400 text-xs">[自动]</span>':'';rh+='<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span> '+autoTag+'<br><span class="text-gray-600 text-xs">'+c.time+'</span></div>';});
+            var rh='';d.recent_claims.forEach(c=>{var autoTag=c.auto_redeemed?'<span class="text-green-400">[自动]</span>':'';rh+='<div class="bg-gray-800/50 p-2 rounded text-gray-400"><span class="text-blue-400">ID:'+c.user_id+'</span> '+c.username+' <span class="text-green-400">$'+c.quota+'</span> '+autoTag+'<br><span class="text-gray-600">'+c.time+'</span></div>';});
             document.getElementById('recentBox').innerHTML=rh||'<p class="text-gray-600">暂无</p>';
         });
     }
