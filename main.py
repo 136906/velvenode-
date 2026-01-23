@@ -467,7 +467,8 @@ def calculate_user_cooldown_status(db: Session, user_id: int, now: datetime):
 @app.get("/api/auth/check")
 async def check_auth(request: Request, db: Session = Depends(get_db)):
     """检查用户登录状态"""
-    # 优先检查本站 session
+    from fastapi.responses import JSONResponse
+    
     local_token = request.cookies.get("coupon_session")
     if local_token:
         session = get_session(db, local_token)
@@ -481,20 +482,25 @@ async def check_auth(request: Request, db: Session = Depends(get_db)):
                 }
             }
     
-    # 尝试使用主站 session（cookie 共享场景）
     main_session = request.cookies.get("session")
     if main_session:
         user_info = await verify_user_by_main_session(main_session)
         if user_info:
-            # 创建本站会话
             token = create_session(db, user_info["user_id"], user_info["username"], main_session)
-            response_data = {
+            response = JSONResponse(content={
                 "success": True,
                 "logged_in": True,
-                "data": user_info,
-                "set_cookie": token  # 前端需要设置 cookie
-            }
-            return response_data
+                "data": user_info
+            })
+            response.set_cookie(
+                key="coupon_session",
+                value=token,
+                max_age=7*24*3600,
+                httponly=True,
+                samesite="lax",
+                path="/"
+            )
+            return response
     
     return {"success": False, "logged_in": False, "message": "未登录"}
 
@@ -1337,10 +1343,6 @@ CLAIM_PAGE = '''<!DOCTYPE html>
             document.getElementById('sec-loading').style.display='none';
             if(d.success && d.logged_in){
                 userData = d.data;
-                // 如果返回了 set_cookie，设置本站 cookie
-                if(d.set_cookie){
-                    document.cookie = 'coupon_session=' + d.set_cookie + ';path=/;max-age=' + (7*24*3600) + ';samesite=lax';
-                }
                 showLoggedIn();
                 loadStatus();
             }else{
