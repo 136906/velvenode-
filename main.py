@@ -245,46 +245,53 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
         
         # URL 解码
         session_cookie = unquote(session_cookie)
-        print(f"[AUTH] session_cookie 前100字符: {session_cookie[:100]}")
         
-        parts = session_cookie.split("|")
-        print(f"[AUTH] session 分割后有 {len(parts)} 部分")
-        if len(parts) < 2:
+        # 打印原始值用于调试
+        print(f"[AUTH] session 长度: {len(session_cookie)}")
+        print(f"[AUTH] session 是否包含 |: {'|' in session_cookie}")
+        
+        # 找到 | 的位置
+        pipe_positions = [i for i, c in enumerate(session_cookie) if c == '|']
+        print(f"[AUTH] | 的位置: {pipe_positions}")
+        
+        if len(pipe_positions) < 2:
+            print("[AUTH] 格式不对，没有足够的 | 分隔符")
             return None
+        
+        # 手动分割
+        timestamp = session_cookie[:pipe_positions[0]]
+        base64_data = session_cookie[pipe_positions[0]+1:pipe_positions[1]]
+        signature = session_cookie[pipe_positions[1]+1:]
+        
+        print(f"[AUTH] timestamp: {timestamp}")
+        print(f"[AUTH] base64_data 长度: {len(base64_data)}")
         
         # 解码 base64
         try:
-            decoded = base64.b64decode(parts[1])
+            decoded = base64.b64decode(base64_data)
         except:
-            decoded = base64.b64decode(parts[1] + "==")
+            decoded = base64.b64decode(base64_data + "==")
         
         print(f"[AUTH] 解码后长度: {len(decoded)}")
-        print(f"[AUTH] 前50字节: {list(decoded[:50])}")
+        print(f"[AUTH] 前30字节: {list(decoded[:30])}")
         
-        # 查找 id - 在 gob 编码中，格式是 "id" + 类型信息 + 值
+        # 查找 id
         user_id = None
         idx = decoded.find(b'id')
         if idx != -1:
-            print(f"[AUTH] 找到 'id' 在位置 {idx}")
-            print(f"[AUTH] id 后面15字节: {list(decoded[idx:idx+15])}")
-            
-            # 遍历后面的字节找数字
+            print(f"[AUTH] 找到 id 位置: {idx}, 后面字节: {list(decoded[idx:idx+12])}")
             for i in range(idx + 2, min(idx + 12, len(decoded))):
-                b = decoded[i]
-                prev = decoded[i-1] if i > 0 else 0
-                print(f"[AUTH] 位置 {i}: 字节={b}, 前一字节={prev}")
-                # 找到 \x02\x00\x?? 或类似模式，?? 是 user_id
-                if prev == 0 and 1 <= b <= 250:
-                    user_id = b
-                    print(f"[AUTH] 找到 user_id = {user_id}")
+                if decoded[i-1] == 0 and 1 <= decoded[i] <= 250:
+                    user_id = decoded[i]
                     break
         
         if not user_id:
             print("[AUTH] 无法解析 user_id")
             return None
         
+        print(f"[AUTH] 解析到 user_id: {user_id}")
+        
         # 用系统令牌获取用户信息
-        print(f"[AUTH] 调用 API 获取用户 {user_id} 信息")
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{NEW_API_URL}/api/user/{user_id}",
@@ -296,18 +303,13 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
             print(f"[AUTH] API 状态码: {response.status_code}")
             if response.status_code == 200:
                 data = response.json()
-                print(f"[AUTH] API 返回: success={data.get('success')}")
                 if data.get("success"):
                     user_data = data.get("data", {})
-                    result = {
+                    return {
                         "user_id": user_data.get("id"),
                         "username": user_data.get("username"),
                         "display_name": user_data.get("display_name", user_data.get("username"))
                     }
-                    print(f"[AUTH] 成功: {result}")
-                    return result
-            else:
-                print(f"[AUTH] API 错误: {response.text}")
         
         return None
     except Exception as e:
@@ -2061,6 +2063,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
