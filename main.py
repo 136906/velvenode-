@@ -518,28 +518,30 @@ async def check_auth(request: Request, db: Session = Depends(get_db)):
     """检查用户登录状态"""
     from fastapi.responses import JSONResponse
     
-    local_token = request.cookies.get("coupon_session")
-    if local_token:
-        session = get_session(db, local_token)
-        if session:
-            return {
-                "success": True,
-                "logged_in": True,
-                "data": {
-                    "user_id": session.user_id,
-                    "username": session.username
-                }
-            }
-    
     main_session = request.cookies.get("session")
+    local_token = request.cookies.get("coupon_session")
+    
+    # 先验证主站 session
+    main_user = None
     if main_session:
-        user_info = await verify_user_by_main_session(main_session)
-        if user_info:
-            token = create_session(db, user_info["user_id"], user_info["username"], main_session)
+        main_user = await verify_user_by_main_session(main_session)
+    
+    # 检查本站 session
+    local_session = get_session(db, local_token) if local_token else None
+    
+    # 如果主站已登录
+    if main_user:
+        # 如果本站 session 不存在，或者用户变了，重新创建
+        if not local_session or local_session.user_id != main_user["user_id"]:
+            # 删除旧 session
+            if local_token:
+                delete_session(db, local_token)
+            # 创建新 session
+            token = create_session(db, main_user["user_id"], main_user["username"], main_session)
             response = JSONResponse(content={
                 "success": True,
                 "logged_in": True,
-                "data": user_info
+                "data": main_user
             })
             response.set_cookie(
                 key="coupon_session",
@@ -550,6 +552,27 @@ async def check_auth(request: Request, db: Session = Depends(get_db)):
                 path="/"
             )
             return response
+        else:
+            # 用户没变，直接返回
+            return {
+                "success": True,
+                "logged_in": True,
+                "data": {
+                    "user_id": local_session.user_id,
+                    "username": local_session.username
+                }
+            }
+    
+    # 主站未登录，检查本站 session
+    if local_session:
+        return {
+            "success": True,
+            "logged_in": True,
+            "data": {
+                "user_id": local_session.user_id,
+                "username": local_session.username
+            }
+        }
     
     return {"success": False, "logged_in": False, "message": "未登录"}
 
@@ -2034,6 +2057,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
