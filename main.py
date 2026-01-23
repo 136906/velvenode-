@@ -239,73 +239,87 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
         return None
     
     try:
-        # 尝试解析 session cookie 获取用户信息
-        # New-API 的 session 格式: timestamp|base64data|signature
+        import base64
+        import re
+        
         parts = session_cookie.split("|")
-        if len(parts) >= 2:
-            import base64
+        if len(parts) < 2:
+            return None
+        
+        # 解码中间的 base64 部分
+        try:
+            padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            decoded = base64.b64decode(padded)
+            decoded_str = decoded.decode("latin-1")
+        except:
+            return None
+        
+        # 从解码后的数据中提取 id 和 username
+        # 格式类似: ...id.int.X...username.string.XXX...
+        user_id = None
+        username = None
+        
+        # 查找 id (在 "id" 标记后面的数字)
+        id_pattern = rb'id\x03int\x04\x02\x00([\x00-\xff])'
+        id_match = re.search(id_pattern, decoded)
+        if id_match:
+            user_id = id_match.group(1)[0]
+        
+        # 如果上面的方式不行，尝试另一种方式
+        if not user_id:
+            # 查找所有可能的数字
+            for i, b in enumerate(decoded):
+                if i > 0 and decoded[i-1:i] == b'\x02' and 1 <= b <= 200:
+                    # 可能是 user_id
+                    if user_id is None or b < user_id:
+                        user_id = b
+        
+        # 查找 username
+        username_match = re.search(rb'username\x06string\x0c.([\x00-\xff]+?)\x06string', decoded)
+        if username_match:
             try:
-                # 解码中间部分
-                decoded = base64.b64decode(parts[1] + "==")
-                decoded_str = decoded.decode("utf-8", errors="ignore")
-                
-                # 查找 username 和 id
-                # 格式类似: ...username.string..velvenode...id.int...
-                import re
-                
-                # 提取 username
-                username_match = re.search(r'username.{1,20}?([a-zA-Z0-9_@.]+)', decoded_str)
-                username = None
-                if username_match:
-                    # 找到 username 后面的实际值
-                    remaining = decoded_str[username_match.start():]
-                    # 用户名通常在 string 标记后
-                    for word in remaining.split('\x00'):
-                        word = word.strip()
-                        if word and len(word) > 2 and word not in ['username', 'string', 'int', 'role', 'status', 'group']:
-                            if '@' in word or word.isalnum() or '_' in word:
-                                username = word
-                                break
-                
-                # 提取 id
-                id_match = re.search(r'id.{1,10}?(\d+)', decoded_str)
-                user_id = None
-                if id_match:
-                    user_id = int(id_match.group(1))
-                
-                # 如果解析失败，尝试另一种方式
-                if not username or not user_id:
-                    # 直接在解码字符串中查找
-                    if 'velvenode' in decoded_str:
-                        username = 'velvenode'
-                    # 查找数字作为 id
-                    numbers = re.findall(r'\x02(\d+)', decoded_str)
-                    if numbers:
-                        for n in numbers:
-                            if 1 <= int(n) <= 100000:
-                                user_id = int(n)
-                                break
-                
-                if user_id and username:
-                    # 验证这个用户确实存在，调用 API
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        response = await client.get(
-                            f"{NEW_API_URL}/api/user/self",
-                            cookies={"session": session_cookie},
-                            headers={"New-Api-User": str(user_id)}
-                        )
-                        if response.status_code == 200:
-                            data = response.json()
-                            if data.get("success"):
-                                user_data = data.get("data", {})
-                                return {
-                                    "user_id": user_data.get("id", user_id),
-                                    "username": user_data.get("username", username),
-                                    "display_name": user_data.get("display_name", username)
-                                }
-                
-            except Exception as e:
-                print(f"解析session失败: {e}")
+                username = username_match.group(1).decode("utf-8")
+            except:
+                pass
+        
+        # 另一种方式查找 username
+        if not username:
+            if b'velvenode' in decoded:
+                username = 'velvenode'
+            else:
+                # 尝试找其他用户名
+                str_matches = re.findall(rb'\x0c.([\x20-\x7e]{3,30})\x06', decoded)
+                for m in str_matches:
+                    try:
+                        name = m.decode("utf-8")
+                        if name and name not in ['string', 'int', 'role', 'status', 'group']:
+                            username = name
+                            break
+                    except:
+                        pass
+        
+        if not user_id:
+            print(f"无法从session解析user_id")
+            return None
+        
+        # 用管理员令牌验证这个用户
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{NEW_API_URL}/api/user/{user_id}",
+                headers={
+                    "Authorization": f"Bearer {ADMIN_ACCESS_TOKEN}",
+                    "New-Api-User": ADMIN_USER_ID
+                }
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("success"):
+                    user_data = data.get("data", {})
+                    return {
+                        "user_id": user_data.get("id", user_id),
+                        "username": user_data.get("username", username or "unknown"),
+                        "display_name": user_data.get("display_name", username or "unknown")
+                    }
         
         return None
     except Exception as e:
@@ -2034,4 +2048,5 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
