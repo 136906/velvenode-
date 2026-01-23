@@ -236,62 +236,61 @@ def delete_session(db: Session, token: str):
 async def verify_user_by_main_session(session_cookie: str) -> dict | None:
     """通过主站的 session cookie 验证用户"""
     if not session_cookie:
-        print("[AUTH] 没有 session_cookie")
         return None
     
     try:
         import base64
-        from urllib.parse import unquote
         
-        # URL 解码
-        session_cookie = unquote(session_cookie)
+        # 直接尝试找 base64 部分并解码
+        # session 格式可能是: timestamp|base64|signature 或整个都是 base64
         
-        # 打印原始值用于调试
-        print(f"[AUTH] session 长度: {len(session_cookie)}")
-        print(f"[AUTH] session 是否包含 |: {'|' in session_cookie}")
+        # 尝试找到有效的 base64 部分
+        # 通常以大写字母开头，以 = 或字母结尾
         
-        # 找到 | 的位置
-        pipe_positions = [i for i, c in enumerate(session_cookie) if c == '|']
-        print(f"[AUTH] | 的位置: {pipe_positions}")
+        # 先尝试整体解码
+        decoded = None
+        try:
+            decoded = base64.b64decode(session_cookie + "==")
+        except:
+            pass
         
-        if len(pipe_positions) < 2:
-            print("[AUTH] 格式不对，没有足够的 | 分隔符")
+        if not decoded:
+            # 尝试找 base64 片段
+            for start in range(0, min(50, len(session_cookie))):
+                for end in range(len(session_cookie), max(start + 50, len(session_cookie) - 50), -1):
+                    try:
+                        part = session_cookie[start:end]
+                        decoded = base64.b64decode(part + "==")
+                        if b'id' in decoded and b'username' in decoded:
+                            print(f"[AUTH] 找到有效片段: {start}-{end}")
+                            break
+                    except:
+                        continue
+                if decoded and b'id' in decoded:
+                    break
+        
+        if not decoded or b'id' not in decoded:
+            print(f"[AUTH] 无法解码 session")
             return None
         
-        # 手动分割
-        timestamp = session_cookie[:pipe_positions[0]]
-        base64_data = session_cookie[pipe_positions[0]+1:pipe_positions[1]]
-        signature = session_cookie[pipe_positions[1]+1:]
-        
-        print(f"[AUTH] timestamp: {timestamp}")
-        print(f"[AUTH] base64_data 长度: {len(base64_data)}")
-        
-        # 解码 base64
-        try:
-            decoded = base64.b64decode(base64_data)
-        except:
-            decoded = base64.b64decode(base64_data + "==")
-        
-        print(f"[AUTH] 解码后长度: {len(decoded)}")
-        print(f"[AUTH] 前30字节: {list(decoded[:30])}")
+        print(f"[AUTH] 解码成功，长度: {len(decoded)}")
         
         # 查找 id
         user_id = None
         idx = decoded.find(b'id')
         if idx != -1:
-            print(f"[AUTH] 找到 id 位置: {idx}, 后面字节: {list(decoded[idx:idx+12])}")
-            for i in range(idx + 2, min(idx + 12, len(decoded))):
+            for i in range(idx + 2, min(idx + 15, len(decoded))):
                 if decoded[i-1] == 0 and 1 <= decoded[i] <= 250:
                     user_id = decoded[i]
                     break
         
         if not user_id:
-            print("[AUTH] 无法解析 user_id")
+            print(f"[AUTH] 无法解析 user_id")
             return None
         
-        print(f"[AUTH] 解析到 user_id: {user_id}")
+        print(f"[AUTH] user_id: {user_id}")
         
-        # 用系统令牌获取用户信息
+        # 调用 API
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{NEW_API_URL}/api/user/{user_id}",
@@ -300,7 +299,6 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
                     "New-Api-User": ADMIN_USER_ID
                 }
             )
-            print(f"[AUTH] API 状态码: {response.status_code}")
             if response.status_code == 200:
                 data = response.json()
                 if data.get("success"):
@@ -314,8 +312,6 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
         return None
     except Exception as e:
         print(f"[AUTH] 异常: {e}")
-        import traceback
-        traceback.print_exc()
         return None
 
 async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> str | None:
@@ -2063,6 +2059,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
