@@ -241,6 +241,11 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
     
     try:
         import base64
+        from urllib.parse import unquote
+        
+        # URL 解码
+        session_cookie = unquote(session_cookie)
+        print(f"[AUTH] session_cookie 前100字符: {session_cookie[:100]}")
         
         parts = session_cookie.split("|")
         print(f"[AUTH] session 分割后有 {len(parts)} 部分")
@@ -2056,6 +2061,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
