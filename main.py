@@ -241,64 +241,62 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
     try:
         import base64
         
-        # 直接尝试找 base64 部分并解码
-        # session 格式可能是: timestamp|base64|signature 或整个都是 base64
+        # Gorilla session 格式: base64(timestamp)|base64(gob_data)|signature
+        parts = session_cookie.split("|")
+        if len(parts) < 2:
+            print("[AUTH] Session 格式错误，缺少分隔符")
+            return None
         
-        # 尝试找到有效的 base64 部分
-        # 通常以大写字母开头，以 = 或字母结尾
-        
-        # 先尝试整体解码
+        # 解码第二部分（gob 编码的数据）
+        data_part = parts[1]
         decoded = None
-        try:
-            decoded = base64.b64decode(session_cookie + "==")
-        except:
-            pass
+        for suffix in ['', '=', '==', '===']:
+            try:
+                decoded = base64.urlsafe_b64decode(data_part + suffix)
+                break
+            except:
+                continue
         
         if not decoded:
-            # 尝试找 base64 片段
-            for start in range(0, min(50, len(session_cookie))):
-                for end in range(len(session_cookie), max(start + 50, len(session_cookie) - 50), -1):
-                    try:
-                        part = session_cookie[start:end]
-                        decoded = base64.b64decode(part + "==")
-                        if b'id' in decoded and b'username' in decoded:
-                            print(f"[AUTH] 找到有效片段: {start}-{end}")
-                            break
-                    except:
-                        continue
-                if decoded and b'id' in decoded:
-                    break
-        
-        if not decoded or b'id' not in decoded:
-            print(f"[AUTH] 无法解码 session")
+            print("[AUTH] Base64 解码失败")
             return None
         
-        print(f"[AUTH] 解码成功，长度: {len(decoded)}")
-        
-        # 查找 id
-        user_id = None
+        # 查找 id 字段
         idx = decoded.find(b'id')
-        if idx != -1:
-            for i in range(idx + 2, min(idx + 15, len(decoded))):
-                if decoded[i-1] == 0 and 1 <= decoded[i] <= 250:
-                    user_id = decoded[i]
-                    break
-        
-        if not user_id:
-            print(f"[AUTH] 无法解析 user_id")
+        if idx == -1:
+            print("[AUTH] 未找到 id 字段")
             return None
         
-        print(f"[AUTH] user_id: {user_id}")
+        # 在 id 后面查找 \x04\x02\x00 模式（gob int 编码标记）
+        search_area = decoded[idx:idx+30]
+        marker_idx = search_area.find(b'\x04\x02\x00')
         
-        # 调用 API
+        if marker_idx == -1:
+            print("[AUTH] 未找到数值标记")
+            return None
+        
+        # 标记后面的字节除以2就是真实 user_id（gob varint 编码特性）
+        raw_value = search_area[marker_idx + 3]
+        user_id = raw_value // 2
+        
+        print(f"[AUTH] 解析成功 - 原始值: {raw_value}, user_id: {user_id}")
+        
+        if user_id <= 0:
+            print("[AUTH] user_id 无效")
+            return None
+        
+        # 用管理员令牌获取用户完整信息
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{NEW_API_URL}/api/user/{user_id}",
                 headers={
                     "Authorization": f"Bearer {ADMIN_ACCESS_TOKEN}",
-                    "New-Api-User": ADMIN_USER_ID
+                    "New-Api-User": str(ADMIN_USER_ID)
                 }
             )
+            
+            print(f"[AUTH] API 响应状态: {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
                 if data.get("success"):
@@ -310,8 +308,11 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
                     }
         
         return None
+        
     except Exception as e:
         print(f"[AUTH] 异常: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> str | None:
@@ -2059,6 +2060,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
