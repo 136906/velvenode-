@@ -241,6 +241,7 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
     try:
         import base64
         
+        # 第一次解码
         decoded = None
         for suffix in ['', '=', '==', '===']:
             try:
@@ -250,23 +251,42 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
                 continue
         
         if not decoded:
-            print("[AUTH] Base64 解码失败")
+            print("[AUTH] 第一次 Base64 解码失败")
             return None
         
-        print(f"[AUTH] 解码成功，长度: {len(decoded)}")
-        print(f"[AUTH] 解码内容 hex: {decoded.hex()}")
-        print(f"[AUTH] 解码内容 repr: {repr(decoded)}")
+        # 转成字符串，按 | 分割
+        decoded_str = decoded.decode('utf-8', errors='ignore')
+        parts = decoded_str.split('|')
+        
+        if len(parts) < 2:
+            print("[AUTH] 分割失败")
+            return None
+        
+        # 第二部分再次 base64 解码
+        data_part = parts[1]
+        gob_data = None
+        for suffix in ['', '=', '==', '===']:
+            try:
+                gob_data = base64.urlsafe_b64decode(data_part + suffix)
+                break
+            except:
+                continue
+        
+        if not gob_data:
+            print("[AUTH] 第二次 Base64 解码失败")
+            return None
+        
+        print(f"[AUTH] gob 数据长度: {len(gob_data)}")
+        print(f"[AUTH] gob 数据 hex: {gob_data.hex()}")
         
         # 查找 id 字段
-        idx = decoded.find(b'id')
-        print(f"[AUTH] 'id' 位置: {idx}")
-        
+        idx = gob_data.find(b'id')
         if idx == -1:
             print("[AUTH] 未找到 id 字段")
             return None
         
         # 在 id 后面查找 \x04\x02\x00 模式
-        search_area = decoded[idx:idx+30]
+        search_area = gob_data[idx:idx+30]
         marker_idx = search_area.find(b'\x04\x02\x00')
         
         if marker_idx == -1:
@@ -306,8 +326,9 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
         
     except Exception as e:
         print(f"[AUTH] 异常: {e}")
+        import traceback
+        traceback.print_exc()
         return None
-
 async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> str | None:
     if not ADMIN_ACCESS_TOKEN:
         print("错误: ADMIN_ACCESS_TOKEN 未配置")
@@ -2053,6 +2074,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
