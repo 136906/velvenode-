@@ -240,9 +240,20 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
     
     try:
         import base64
+        from urllib.parse import unquote
+        
+        # 打印原始值用于调试
+        print(f"[AUTH] 原始 session 长度: {len(session_cookie)}")
+        print(f"[AUTH] 原始 session 前100字符: {session_cookie[:100]}")
+        
+        # 尝试 URL 解码
+        session_cookie = unquote(session_cookie)
+        print(f"[AUTH] URL解码后前100字符: {session_cookie[:100]}")
         
         # Gorilla session 格式: base64(timestamp)|base64(gob_data)|signature
         parts = session_cookie.split("|")
+        print(f"[AUTH] 分割后 parts 数量: {len(parts)}")
+        
         if len(parts) < 2:
             print("[AUTH] Session 格式错误，缺少分隔符")
             return None
@@ -275,7 +286,7 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
             print("[AUTH] 未找到数值标记")
             return None
         
-        # 标记后面的字节除以2就是真实 user_id（gob varint 编码特性）
+        # 标记后面的字节除以2就是真实 user_id
         raw_value = search_area[marker_idx + 3]
         user_id = raw_value // 2
         
@@ -2060,6 +2071,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
