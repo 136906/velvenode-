@@ -364,14 +364,15 @@ async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> s
         print(f"创建兑换码异常: {e}")
         return None
 
-async def topup_user_by_admin(user_id: int, redemption_code: str) -> bool:
-    """使用管理员令牌为用户充值"""
+async def topup_user_by_admin(user_id: int, quota: int, remark: str = "抽奖充值") -> bool:
+    """使用管理员接口直接给用户增加额度"""
     if not ADMIN_ACCESS_TOKEN or not user_id:
+        print(f"[TOPUP] 参数缺失")
         return False
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
-                f"{NEW_API_URL}/api/topup",
+                f"{NEW_API_URL}/api/user/topup/complete",
                 headers={
                     "Authorization": f"Bearer {ADMIN_ACCESS_TOKEN}",
                     "New-Api-User": str(ADMIN_USER_ID),
@@ -379,10 +380,11 @@ async def topup_user_by_admin(user_id: int, redemption_code: str) -> bool:
                 },
                 json={
                     "user_id": user_id,
-                    "key": redemption_code
+                    "quota": quota,
+                    "remark": remark
                 }
             )
-            print(f"[TOPUP] 响应: {response.status_code} - {response.text[:200]}")
+            print(f"[TOPUP] user_id={user_id}, quota={quota}, 响应: {response.status_code} - {response.text[:300]}")
             if response.status_code == 200:
                 result = response.json()
                 return result.get("success", False)
@@ -724,7 +726,6 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     
     user_id = session.user_id
     username = session.username
-    main_session = session.main_site_session
     cooldown_minutes = get_cooldown_minutes(db)
     now = now_utc()
     
@@ -750,6 +751,7 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     auto_redeemed = False
     
     if claim_mode == "A":
+        # A模式：优先本地兑换码，否则调用API创建
         local_coupon = get_local_coupon(db, quota)
         if local_coupon:
             coupon_code = local_coupon.coupon_code
@@ -772,26 +774,21 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
                 )
                 db.add(new_coupon)
     else:
-        coupon_code = await create_redemption_code_via_api(quota, db)
-        if coupon_code:
+        # B模式：直接给用户充值，不创建兑换码
+        quota_rate = get_quota_rate(db)
+        topup_quota = int(quota * quota_rate)
+        
+        if await topup_user_by_admin(user_id, topup_quota, f"抽奖${quota}"):
+            auto_redeemed = True
             deduct_virtual_stock(db, quota)
-            new_coupon = CouponPool(
-                coupon_code=coupon_code,
-                quota_dollars=quota,
-                is_claimed=True,
-                claimed_by_user_id=user_id,
-                claimed_by_username=username,
-                claimed_at=now,
-                source="api"
-            )
-            db.add(new_coupon)
-            
-            # B模式自动充值
-            if await topup_user_by_admin(user_id, coupon_code):
-                auto_redeemed = True
+            coupon_code = f"DIRECT-{user_id}-{int(now.timestamp())}"
+            print(f"[CLAIM] 直接充值成功: user_id={user_id}, quota={topup_quota}")
+        else:
+            print(f"[CLAIM] 直接充值失败")
+            raise HTTPException(status_code=500, detail="充值失败，请稍后重试")
     
     if not coupon_code:
-        raise HTTPException(status_code=500, detail="兑换码生成失败，请稍后重试")
+        raise HTTPException(status_code=500, detail="领取失败，请稍后重试")
     
     cooldown_expires = now + timedelta(minutes=cooldown_minutes)
     record = ClaimRecord(
@@ -809,7 +806,7 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
     return {
         "success": True,
         "data": {
-            "coupon_code": coupon_code,
+            "coupon_code": coupon_code if not auto_redeemed else None,
             "quota": quota,
             "remaining_claims": remaining_claims - 1,
             "auto_redeemed": auto_redeemed,
@@ -1094,43 +1091,33 @@ HOME_PAGE = '''<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root{--bg:#0a0a0f;--card:#12121a;--border:#1f1f2e;--accent:#3b82f6}
-        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif}
-        .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
-        .btn{padding:10px 20px;border-radius:8px;font-weight:500;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;border:none;font-size:14px}
-        .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
+        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif;padding-top:80px}
+        .card{background:var(--card);border:1px solid var(--border);border-radius:16px}
+        .btn{padding:12px 24px;border-radius:10px;font-weight:600;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;gap:8px;cursor:pointer;border:none;font-size:15px}
+        .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb;transform:translateY(-1px)}
         .btn-secondary{background:#1f1f2e;color:#e0e0e0;border:1px solid #2a2a3a}.btn-secondary:hover{background:#2a2a3a}
         .btn-console{background:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#fff}.btn-console:hover{opacity:0.9}
-        .code-box{background:#0d0d12;border:1px solid var(--border);border-radius:8px;padding:12px 16px;font-family:ui-monospace,monospace}
-        .glow{box-shadow:0 0 40px rgba(59,130,246,0.15)}
+        .code-box{background:#0d0d12;border:1px solid var(--border);border-radius:12px;padding:16px 20px;font-family:ui-monospace,monospace}
+        .glow{box-shadow:0 0 50px rgba(59,130,246,0.15)}
     </style>
 </head>
 <body class="min-h-screen">
-    <nav class="border-b border-gray-800 px-4 py-3 sticky top-0 bg-[#0a0a0f]/95 backdrop-blur z-50">
-        <div class="max-w-5xl mx-auto flex justify-between items-center">
-            <a href="/" class="text-lg font-bold text-white">{{SITE_NAME}}</a>
-            <div class="flex items-center gap-2">
-                <a href="{{NEW_API_URL}}/console" target="_blank" class="text-gray-400 hover:text-white text-sm px-3 py-1.5">控制台</a>
-                <a href="/claim" class="btn btn-primary text-sm px-4 py-1.5">🎫 领券</a>
-            </div>
-        </div>
-    </nav>
-
-    <section class="py-12 md:py-20 px-4">
+    <section class="py-16 px-6">
         <div class="max-w-3xl mx-auto text-center">
-            <h1 class="text-3xl md:text-5xl font-bold mb-4 bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent leading-tight">统一的大模型API网关</h1>
-            <p class="text-base md:text-lg text-gray-400 mb-8">更低的价格，更稳定的服务，只需替换API地址即可使用</p>
+            <h1 class="text-4xl md:text-5xl font-bold mb-5 bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent leading-tight">统一的大模型API网关</h1>
+            <p class="text-lg text-gray-400 mb-10">更低的价格，更稳定的服务，只需替换API地址即可使用</p>
             
-            <div class="code-box max-w-xl mx-auto mb-8">
-                <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div class="code-box max-w-xl mx-auto mb-10">
+                <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                     <div class="flex items-center gap-2 text-sm overflow-hidden">
                         <span class="text-gray-500 shrink-0">API:</span>
                         <span class="text-blue-400 truncate">{{NEW_API_URL}}</span>
                     </div>
-                    <button onclick="copyAPI()" id="copy-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded transition shrink-0">复制</button>
+                    <button onclick="copyAPI()" id="copy-btn" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-5 py-2 rounded-lg transition shrink-0">复制</button>
                 </div>
             </div>
             
-            <div class="flex flex-wrap justify-center gap-3">
+            <div class="flex flex-wrap justify-center gap-4">
                 <a href="{{NEW_API_URL}}/console/token" target="_blank" class="btn btn-primary">🔑 获取API Key</a>
                 <a href="{{NEW_API_URL}}/console" target="_blank" class="btn btn-console">🖥️ 控制台</a>
                 <a href="/claim" class="btn btn-secondary">🎫 领取兑换券</a>
@@ -1138,37 +1125,37 @@ HOME_PAGE = '''<!DOCTYPE html>
         </div>
     </section>
 
-    <section class="py-12 px-4 border-t border-gray-800">
+    <section class="py-14 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-xl md:text-2xl font-bold mb-6 flex items-center gap-2"><span>📖</span> 快速接入</h2>
-            <div class="grid md:grid-cols-2 gap-4">
-                <div class="card p-5">
-                    <h3 class="font-semibold mb-3 text-blue-400">1️⃣ 获取API Key</h3>
-                    <ol class="space-y-1.5 text-gray-400 text-sm">
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-3"><span>📖</span> 快速接入</h2>
+            <div class="grid md:grid-cols-2 gap-5">
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-blue-400">1️⃣ 获取API Key</h3>
+                    <ol class="space-y-2 text-gray-400 text-sm">
                         <li>1. 访问 <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">控制台</a> 注册登录</li>
                         <li>2. 进入「令牌管理」创建密钥</li>
                         <li>3. 复制生成的 sk-xxx</li>
                     </ol>
                 </div>
-                <div class="card p-5">
-                    <h3 class="font-semibold mb-3 text-green-400">2️⃣ 配置使用</h3>
-                    <div class="code-box text-sm mb-2 py-2">
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-green-400">2️⃣ 配置使用</h3>
+                    <div class="code-box text-sm mb-3 py-3">
                         <div class="text-gray-500 text-xs"># Base URL</div>
                         <div class="text-green-400 truncate">{{NEW_API_URL}}</div>
                     </div>
                     <p class="text-gray-400 text-sm">替换到你的应用中即可</p>
                 </div>
-                <div class="card p-5">
-                    <h3 class="font-semibold mb-3 text-purple-400">3️⃣ ChatGPT-Next-Web</h3>
-                    <ol class="space-y-1.5 text-gray-400 text-sm">
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-purple-400">3️⃣ ChatGPT-Next-Web</h3>
+                    <ol class="space-y-2 text-gray-400 text-sm">
                         <li>设置 → 自定义接口</li>
-                        <li>接口地址: <code class="text-purple-400 bg-purple-900/30 px-1 rounded text-xs">{{NEW_API_URL}}</code></li>
+                        <li>接口地址: <code class="text-purple-400 bg-purple-900/30 px-1.5 py-0.5 rounded text-xs">{{NEW_API_URL}}</code></li>
                         <li>填入API Key保存即可</li>
                     </ol>
                 </div>
-                <div class="card p-5">
-                    <h3 class="font-semibold mb-3 text-orange-400">4️⃣ Python示例</h3>
-                    <div class="code-box text-xs overflow-x-auto py-2">
+                <div class="card p-6">
+                    <h3 class="font-semibold text-lg mb-4 text-orange-400">4️⃣ Python示例</h3>
+                    <div class="code-box text-xs overflow-x-auto py-3">
                         <pre class="text-gray-300">from openai import OpenAI
 client = OpenAI(
     api_key="sk-xxx",
@@ -1180,46 +1167,46 @@ client = OpenAI(
         </div>
     </section>
 
-    <section class="py-12 px-4 border-t border-gray-800">
+    <section class="py-14 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-xl md:text-2xl font-bold mb-6 flex items-center gap-2"><span>🎫</span> 兑换券领取</h2>
-            <div class="card p-6 md:p-8 glow">
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-3"><span>🎫</span> 兑换券领取</h2>
+            <div class="card p-8 glow">
                 <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
                     <div>
-                        <h3 class="text-lg md:text-xl font-bold mb-2">免费领取API额度</h3>
-                        <p class="text-gray-400 text-sm mb-3">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次</p>
-                        <span class="inline-block bg-green-900/40 text-green-400 px-3 py-1.5 rounded-full border border-green-800 text-sm">📦 可领: <b id="avail-cnt">{{AVAILABLE}}</b> 个</span>
-                        <div id="bigPrizesHome" class="mt-3"></div>
+                        <h3 class="text-xl font-bold mb-3">免费领取API额度</h3>
+                        <p class="text-gray-400 mb-4">每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次</p>
+                        <span class="inline-block bg-green-900/40 text-green-400 px-4 py-2 rounded-full border border-green-700">📦 可领: <b id="avail-cnt">{{AVAILABLE}}</b> 个</span>
+                        <div id="bigPrizesHome" class="mt-4"></div>
                     </div>
-                    <a href="/claim" class="btn btn-primary text-base px-6 py-3 w-full md:w-auto">🎁 立即领取 →</a>
+                    <a href="/claim" class="btn btn-primary text-lg px-8 py-4 w-full md:w-auto justify-center">🎁 立即领取 →</a>
                 </div>
             </div>
         </div>
     </section>
 
-    <section class="py-12 px-4 border-t border-gray-800">
+    <section class="py-14 px-6 border-t border-gray-800">
         <div class="max-w-4xl mx-auto">
-            <h2 class="text-xl md:text-2xl font-bold mb-6 flex items-center gap-2"><span>📋</span> 使用须知</h2>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div class="card p-5">
-                    <h3 class="font-semibold mb-2 text-blue-400 text-sm">✅ 允许使用</h3>
-                    <ul class="text-gray-400 text-sm space-y-1">
+            <h2 class="text-2xl font-bold mb-8 flex items-center gap-3"><span>📋</span> 使用须知</h2>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+                <div class="card p-6">
+                    <h3 class="font-semibold mb-3 text-blue-400">✅ 允许使用</h3>
+                    <ul class="text-gray-400 text-sm space-y-1.5">
                         <li>• 个人学习研究</li>
                         <li>• 小型项目开发</li>
                         <li>• 合理频率调用</li>
                     </ul>
                 </div>
-                <div class="card p-5">
-                    <h3 class="font-semibold mb-2 text-red-400 text-sm">❌ 禁止行为</h3>
-                    <ul class="text-gray-400 text-sm space-y-1">
+                <div class="card p-6">
+                    <h3 class="font-semibold mb-3 text-red-400">❌ 禁止行为</h3>
+                    <ul class="text-gray-400 text-sm space-y-1.5">
                         <li>• 商业盈利用途</li>
                         <li>• 高频滥用接口</li>
                         <li>• 违法违规内容</li>
                     </ul>
                 </div>
-                <div class="card p-5">
-                    <h3 class="font-semibold mb-2 text-yellow-400 text-sm">⚠️ 注意事项</h3>
-                    <ul class="text-gray-400 text-sm space-y-1">
+                <div class="card p-6">
+                    <h3 class="font-semibold mb-3 text-yellow-400">⚠️ 注意事项</h3>
+                    <ul class="text-gray-400 text-sm space-y-1.5">
                         <li>• 请勿分享API Key</li>
                         <li>• 违规将被封禁</li>
                         <li>• 额度用完可领券</li>
@@ -1229,7 +1216,7 @@ client = OpenAI(
         </div>
     </section>
 
-    <footer class="border-t border-gray-800 py-6 px-4 text-center text-gray-500 text-sm">
+    <footer class="border-t border-gray-800 py-8 px-6 text-center text-gray-500 text-sm">
         <p>{{SITE_NAME}} © 2025 | <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:underline">控制台</a> | <a href="/claim" class="text-blue-400 hover:underline">领券中心</a></p>
     </footer>
 
@@ -1247,7 +1234,7 @@ client = OpenAI(
             if(d.big_prizes && d.big_prizes.length > 0){
                 var html='<div class="flex gap-2 flex-wrap">';
                 d.big_prizes.forEach(function(p){
-                    html+='<span class="bg-yellow-900/50 text-yellow-400 px-2 py-1 rounded text-xs border border-yellow-700">🏆 $'+p.quota+' x'+p.count+'</span>';
+                    html+='<span class="bg-yellow-900/50 text-yellow-400 px-3 py-1.5 rounded-lg text-sm border border-yellow-600">🏆 $'+p.quota+' x'+p.count+'</span>';
                 });
                 html+='</div>';
                 document.getElementById('bigPrizesHome').innerHTML=html;
@@ -1266,135 +1253,154 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root{--bg:#0a0a0f;--card:#12121a;--border:#1f1f2e;--accent:#3b82f6}
-        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif}
-        .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
-        .btn-p{background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;padding:12px 24px;border-radius:8px;font-weight:600;border:none;cursor:pointer;font-size:14px;text-decoration:none;display:inline-block;text-align:center}
-        .btn-p:hover{opacity:0.9}.btn-p:disabled{background:#374151;cursor:not-allowed}
-        .btn-c{background:linear-gradient(135deg,#10b981,#059669);color:#fff;padding:14px 32px;border-radius:10px;font-weight:700;font-size:16px;border:none;cursor:pointer}
-        .btn-c:hover{transform:scale(1.02)}.btn-c:disabled{background:#374151;cursor:not-allowed;transform:none}
-        .ld{display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,0.3);border-radius:50%;border-top-color:#fff;animation:spin 1s linear infinite}
+        body{background:var(--bg);color:#e0e0e0;font-family:system-ui,sans-serif;padding-top:80px;min-height:100vh}
+        .card{background:var(--card);border:1px solid var(--border);border-radius:16px;backdrop-filter:blur(10px)}
+        .btn-claim{background:linear-gradient(135deg,#10b981,#059669);color:#fff;padding:18px 48px;border-radius:14px;font-weight:700;font-size:18px;border:none;cursor:pointer;transition:all .3s;box-shadow:0 4px 20px rgba(16,185,129,0.3)}
+        .btn-claim:hover{transform:translateY(-2px);box-shadow:0 6px 30px rgba(16,185,129,0.4)}
+        .btn-claim:disabled{background:#374151;cursor:not-allowed;transform:none;box-shadow:none}
+        .btn-claim:active{transform:translateY(0)}
+        .ld{display:inline-block;width:20px;height:20px;border:3px solid rgba(255,255,255,0.3);border-radius:50%;border-top-color:#fff;animation:spin 1s linear infinite}
         @keyframes spin{to{transform:rotate(360deg)}}
-        .toast{position:fixed;top:70px;left:50%;transform:translateX(-50%);padding:10px 20px;border-radius:8px;color:#fff;font-weight:500;z-index:9999;animation:fadeIn .3s;font-size:14px}
+        .toast{position:fixed;top:100px;left:50%;transform:translateX(-50%);padding:14px 28px;border-radius:12px;color:#fff;font-weight:500;z-index:9999;animation:fadeIn .3s;box-shadow:0 4px 20px rgba(0,0,0,0.3)}
         @keyframes fadeIn{from{opacity:0;transform:translateX(-50%) translateY(-10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
-        .prize{animation:pop .5s ease-out}
-        @keyframes pop{0%{transform:scale(0.5);opacity:0}50%{transform:scale(1.1)}100%{transform:scale(1);opacity:1}}
-        .cpn{background:linear-gradient(135deg,#3b82f6,#1d4ed8);border-radius:8px;padding:10px 12px;margin-bottom:6px}
-        .amount-big{font-size:40px;font-weight:800;background:linear-gradient(135deg,#fbbf24,#f59e0b);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+        .prize{animation:pop .6s cubic-bezier(0.68,-0.55,0.265,1.55)}
+        @keyframes pop{0%{transform:scale(0.3);opacity:0}100%{transform:scale(1);opacity:1}}
+        .record-item{background:linear-gradient(135deg,rgba(59,130,246,0.1),rgba(16,185,129,0.1));border:1px solid rgba(59,130,246,0.2);border-radius:12px;padding:14px 16px;margin-bottom:10px;transition:all .2s}
+        .record-item:hover{border-color:rgba(59,130,246,0.4);transform:translateX(4px)}
+        .amount-display{font-size:64px;font-weight:800;background:linear-gradient(135deg,#fbbf24,#f59e0b,#ef4444);-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-shadow:0 0 40px rgba(251,191,36,0.3)}
+        .stat-card{background:linear-gradient(135deg,rgba(59,130,246,0.1),rgba(139,92,246,0.1));border:1px solid rgba(59,130,246,0.2);border-radius:12px;padding:16px;text-align:center}
+        .glow-green{box-shadow:0 0 30px rgba(16,185,129,0.2)}
+        .glow-blue{box-shadow:0 0 30px rgba(59,130,246,0.2)}
+        .badge{padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600}
     </style>
 </head>
-<body class="min-h-screen">
-    <nav class="border-b border-gray-800 px-4 py-3 sticky top-0 bg-[#0a0a0f]/95 backdrop-blur z-50">
-        <div class="max-w-4xl mx-auto flex justify-between items-center">
-            <a href="/" class="text-lg font-bold text-white">{{SITE_NAME}}</a>
-            <div id="navRight" class="flex items-center gap-2">
-                <span id="navUser" class="text-gray-400 text-sm hidden"></span>
-                <button id="logoutBtn" onclick="doLogout()" class="text-red-400 text-sm hidden hover:underline">退出</button>
-                <a href="/" class="text-gray-400 hover:text-white text-sm px-2">首页</a>
-            </div>
-        </div>
-    </nav>
-
-    <main class="max-w-4xl mx-auto px-4 py-6">
-        <div id="sec-loading" class="card p-8 text-center">
-            <div class="ld mb-4" style="width:32px;height:32px;border-width:3px;margin:0 auto"></div>
-            <p class="text-gray-400">正在检查登录状态...</p>
+<body>
+    <main class="max-w-5xl mx-auto px-4 py-8">
+        <!-- 加载状态 -->
+        <div id="sec-loading" class="card p-12 text-center glow-blue">
+            <div class="ld mb-4" style="width:40px;height:40px;border-width:4px;margin:0 auto"></div>
+            <p class="text-gray-400 text-lg">正在检查登录状态...</p>
         </div>
 
-        <div id="sec-login" class="card p-6 md:p-8" style="display:none">
-            <div class="text-center mb-6">
-                <div class="text-5xl mb-4">🎁</div>
-                <h1 class="text-xl md:text-2xl font-bold">兑换券领取中心</h1>
-                <p class="text-gray-400 mt-2 text-sm">登录后即可领取免费额度</p>
-                <div class="mt-4 inline-flex items-center bg-blue-900/30 text-blue-300 px-4 py-2 rounded-full border border-blue-800 text-sm">
-                    📦 当前可领: <span id="cnt" class="font-bold ml-1">{{AVAILABLE}}</span> 个
-                </div>
+        <!-- 未登录 -->
+        <div id="sec-login" class="card p-10 max-w-lg mx-auto" style="display:none">
+            <div class="text-center mb-8">
+                <div class="text-6xl mb-4">🎁</div>
+                <h1 class="text-3xl font-bold mb-2">兑换券领取中心</h1>
+                <p class="text-gray-400">登录后即可领取免费额度</p>
             </div>
             
-            <div class="max-w-sm mx-auto">
-                <div class="p-4 bg-green-900/20 border border-green-800 rounded-lg mb-4">
-                    <p class="text-green-400 text-sm mb-2">🚀 一键登录</p>
-                    <p class="text-gray-400 text-xs">点击下方按钮，登录主站后返回即可自动识别</p>
-                </div>
-                <a href="{{NEW_API_URL}}/console" target="_blank" class="btn-p w-full block" id="loginBtn">前往主站登录 →</a>
-                <button onclick="checkAuth()" class="mt-3 w-full text-center text-blue-400 text-sm hover:underline">已登录？点击刷新</button>
+            <div class="text-center mb-6">
+                <span class="inline-flex items-center bg-green-900/30 text-green-400 px-5 py-2.5 rounded-full border border-green-700 text-lg">
+                    📦 当前可领: <b id="cnt" class="ml-2">{{AVAILABLE}}</b> 个
+                </span>
             </div>
+            
+            <div class="p-5 bg-blue-900/20 border border-blue-700 rounded-xl mb-6">
+                <p class="text-blue-400 font-semibold mb-2">🚀 一键登录</p>
+                <p class="text-gray-400 text-sm">请先在主站登录，然后刷新此页面即可自动识别</p>
+            </div>
+            
+            <a href="{{NEW_API_URL}}/console" target="_blank" class="block w-full text-center bg-blue-600 hover:bg-blue-700 text-white py-4 rounded-xl font-semibold text-lg transition">
+                前往主站登录 →
+            </a>
+            <button onclick="checkAuth()" class="w-full mt-4 text-blue-400 hover:text-blue-300 text-sm py-2">
+                已登录？点击刷新状态
+            </button>
             
             <div id="bigPrizesLogin" class="mt-6 text-center"></div>
         </div>
 
+        <!-- 已登录 -->
         <div id="sec-claim" style="display:none">
-            <div class="grid md:grid-cols-3 gap-4">
-                <div class="md:col-span-2 space-y-4">
-                    <div class="card p-4">
-                        <div class="flex justify-between items-center">
-                            <div>
-                                <p class="text-gray-500 text-xs">当前用户</p>
-                                <p id="uinfo" class="font-semibold text-sm"></p>
-                            </div>
-                            <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 text-sm hover:underline">控制台 →</a>
+            <div class="grid lg:grid-cols-3 gap-6">
+                <!-- 左侧主区域 -->
+                <div class="lg:col-span-2 space-y-6">
+                    <!-- 用户信息 -->
+                    <div class="card p-5 flex justify-between items-center">
+                        <div>
+                            <p class="text-gray-500 text-sm">当前用户</p>
+                            <p id="uinfo" class="font-bold text-lg"></p>
+                        </div>
+                        <div class="flex items-center gap-4">
+                            <a href="{{NEW_API_URL}}/console" target="_blank" class="text-blue-400 hover:text-blue-300 text-sm">控制台 →</a>
+                            <button onclick="doLogout()" class="text-red-400 hover:text-red-300 text-sm">退出</button>
                         </div>
                     </div>
                     
-                    <div class="card p-5">
-                        <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
-                            <h2 class="font-semibold text-sm">领取状态</h2>
+                    <!-- 抽奖区域 -->
+                    <div class="card p-8 glow-green">
+                        <div class="flex flex-wrap justify-between items-center gap-3 mb-6">
+                            <h2 class="font-bold text-xl">🎰 抽取额度</h2>
                             <div class="flex items-center gap-2 flex-wrap">
-                                <span id="modeBadge" class="px-2 py-0.5 rounded text-xs"></span>
-                                <span id="remainBadge" class="px-2 py-0.5 rounded text-xs bg-purple-900/50 text-purple-400 border border-purple-700"></span>
-                                <span id="badge" class="px-2 py-0.5 rounded text-xs"></span>
+                                <span id="modeBadge" class="badge"></span>
+                                <span id="remainBadge" class="badge bg-purple-900/50 text-purple-400 border border-purple-600"></span>
+                                <span id="badge" class="badge"></span>
                             </div>
                         </div>
-                        <div class="text-center py-4">
-                            <button type="button" id="claimBtn" class="btn-c" onclick="doClaim()">🎰 抽取兑换券</button>
-                            <p id="cdMsg" class="text-gray-500 mt-3 text-sm"></p>
+                        
+                        <div class="text-center py-6">
+                            <button type="button" id="claimBtn" class="btn-claim" onclick="doClaim()">
+                                🎰 抽取兑换券
+                            </button>
+                            <p id="cdMsg" class="text-gray-500 mt-4 text-sm"></p>
                         </div>
                         
-                        <div id="prizeBox" style="display:none" class="text-center py-6 border-t border-gray-800 mt-4">
+                        <!-- 中奖展示 -->
+                        <div id="prizeBox" style="display:none" class="text-center py-8 border-t border-gray-700 mt-6">
                             <div class="prize">
-                                <div class="text-gray-400 mb-2 text-sm">🎉 恭喜获得</div>
-                                <div id="prizeAmount" class="amount-big mb-3"></div>
-                                <div id="autoRedeemMsg" class="text-green-400 text-sm mb-3" style="display:none">✅ 已自动充值到您的账户</div>
+                                <div class="text-gray-400 mb-3 text-lg">🎉 恭喜获得</div>
+                                <div id="prizeAmount" class="amount-display mb-4"></div>
+                                <div id="autoRedeemMsg" class="bg-green-900/30 text-green-400 py-3 px-6 rounded-xl inline-block" style="display:none">
+                                    ✅ 已自动充值到您的账户
+                                </div>
                                 <div id="manualRedeemBox">
-                                    <div class="text-gray-400 text-xs mb-1">兑换码:</div>
-                                    <div id="prizeCode" class="font-mono text-sm bg-gray-800 p-2 rounded border border-gray-700 mb-2 break-all"></div>
-                                    <button type="button" class="text-blue-400 text-sm hover:underline" onclick="copyPrize()">📋 复制兑换码</button>
-                                    <p class="text-xs text-gray-500 mt-2">前往 <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400">钱包充值</a> 兑换</p>
+                                    <div class="text-gray-400 text-sm mb-2">兑换码:</div>
+                                    <div id="prizeCode" class="font-mono text-lg bg-gray-800 p-4 rounded-xl border border-gray-600 mb-4 break-all"></div>
+                                    <button type="button" class="text-blue-400 hover:text-blue-300" onclick="copyPrize()">📋 复制兑换码</button>
+                                    <p class="text-xs text-gray-500 mt-3">前往 <a href="{{NEW_API_URL}}/console/topup" target="_blank" class="text-blue-400 hover:underline">钱包充值</a> 兑换</p>
                                 </div>
                             </div>
                         </div>
                     </div>
                     
-                    <div class="card p-5">
-                        <h2 class="font-semibold mb-3 text-sm">📋 领取记录</h2>
-                        <div id="hist" class="max-h-60 overflow-y-auto"></div>
+                    <!-- 领取记录 -->
+                    <div class="card p-6">
+                        <h2 class="font-bold text-lg mb-4">📋 领取记录</h2>
+                        <div id="hist" class="max-h-80 overflow-y-auto pr-2"></div>
                     </div>
                 </div>
                 
-                <div class="md:col-span-1">
-                    <div id="bigPrizeSection" class="card p-5" style="display:none">
-                        <h2 class="font-semibold mb-3 flex items-center gap-2 text-sm">🏆 大奖池</h2>
+                <!-- 右侧信息栏 -->
+                <div class="space-y-6">
+                    <!-- 大奖池 -->
+                    <div id="bigPrizeSection" class="card p-6" style="display:none">
+                        <h2 class="font-bold text-lg mb-4 flex items-center gap-2">🏆 大奖池</h2>
                         <div id="bigPrizeList"></div>
-                        <p class="text-xs text-gray-500 mt-3">以上大奖等你来抽！</p>
+                        <p class="text-xs text-gray-500 mt-4 text-center">以上大奖等你来抽！</p>
                     </div>
-                    <div id="noBigPrize" class="card p-5 text-center text-gray-500">
-                        <div class="text-3xl mb-2">🎰</div>
-                        <p class="text-sm">暂无大奖</p>
+                    <div id="noBigPrize" class="card p-6 text-center">
+                        <div class="text-5xl mb-3">🎰</div>
+                        <p class="text-gray-500">暂无大奖</p>
                     </div>
                     
-                    <div class="card p-5 mt-4">
-                        <h2 class="font-semibold mb-3 text-sm">📊 统计</h2>
-                        <div class="space-y-2 text-sm">
-                            <div class="flex justify-between">
-                                <span class="text-gray-500">可领取</span>
-                                <span id="statAvail" class="text-green-400 font-bold">-</span>
+                    <!-- 统计 -->
+                    <div class="card p-6">
+                        <h2 class="font-bold text-lg mb-4">📊 统计</h2>
+                        <div class="space-y-4">
+                            <div class="stat-card">
+                                <div id="statAvail" class="text-3xl font-bold text-green-400">-</div>
+                                <div class="text-gray-500 text-sm">可领取</div>
                             </div>
-                            <div class="flex justify-between">
-                                <span class="text-gray-500">冷却时间</span>
-                                <span id="statCd" class="text-gray-300">-</span>
-                            </div>
-                            <div class="flex justify-between">
-                                <span class="text-gray-500">每周期次数</span>
-                                <span id="statTimes" class="text-gray-300">-</span>
+                            <div class="flex gap-3">
+                                <div class="stat-card flex-1">
+                                    <div id="statCd" class="text-lg font-bold text-blue-400">-</div>
+                                    <div class="text-gray-500 text-xs">冷却时间</div>
+                                </div>
+                                <div class="stat-card flex-1">
+                                    <div id="statTimes" class="text-lg font-bold text-purple-400">-</div>
+                                    <div class="text-gray-500 text-xs">每周期</div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1403,8 +1409,9 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         </div>
     </main>
 
-    <footer class="text-center py-6 text-gray-600 text-sm px-4">
-        每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次 | <a href="/" class="text-blue-400 hover:underline">返回首页</a>
+    <footer class="text-center py-8 text-gray-600 text-sm">
+        每 <span id="cd-text">{{COOLDOWN_TEXT}}</span> 可领取 <span id="claim-times">{{CLAIM_TIMES}}</span> 次 | 
+        <a href="/" class="text-blue-400 hover:underline">返回首页</a>
     </footer>
 
     <script>
@@ -1450,17 +1457,12 @@ CLAIM_PAGE = '''<!DOCTYPE html>
     function showLogin(){
         document.getElementById('sec-login').style.display='block';
         document.getElementById('sec-claim').style.display='none';
-        document.getElementById('navUser').classList.add('hidden');
-        document.getElementById('logoutBtn').classList.add('hidden');
     }
 
     function showLoggedIn(){
         document.getElementById('sec-login').style.display='none';
         document.getElementById('sec-claim').style.display='block';
         document.getElementById('uinfo').textContent=userData.username+' (ID:'+userData.user_id+')';
-        document.getElementById('navUser').textContent=userData.username;
-        document.getElementById('navUser').classList.remove('hidden');
-        document.getElementById('logoutBtn').classList.remove('hidden');
     }
 
     function doLogout(){
@@ -1478,15 +1480,13 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         if(!container) return;
         
         if(!prizes || prizes.length === 0){
-            if(containerId === 'bigPrizesLogin'){
-                container.innerHTML = '';
-            }
+            if(containerId === 'bigPrizesLogin') container.innerHTML = '';
             return;
         }
         
         var html = '<div class="flex gap-2 flex-wrap justify-center">';
         prizes.forEach(function(p){
-            html += '<span class="bg-yellow-900/50 text-yellow-400 px-2 py-1 rounded text-xs border border-yellow-700">🏆 $'+p.quota+' x'+p.count+'</span>';
+            html += '<span class="bg-yellow-900/50 text-yellow-400 px-3 py-1.5 rounded-lg text-sm border border-yellow-600 font-semibold">🏆 $'+p.quota+' x'+p.count+'</span>';
         });
         html += '</div>';
         container.innerHTML = html;
@@ -1502,9 +1502,9 @@ CLAIM_PAGE = '''<!DOCTYPE html>
                 
                 var listHtml = '';
                 prizes.forEach(function(p){
-                    listHtml += '<div class="bg-gradient-to-r from-yellow-900/50 to-orange-900/50 border border-yellow-700 rounded-lg p-2 mb-2 flex justify-between items-center">';
-                    listHtml += '<span class="text-yellow-400 font-bold">$' + p.quota + '</span>';
-                    listHtml += '<span class="bg-yellow-500 text-black px-2 py-0.5 rounded font-bold text-xs">x' + p.count + '</span>';
+                    listHtml += '<div class="bg-gradient-to-r from-yellow-900/40 to-orange-900/40 border border-yellow-600 rounded-xl p-4 mb-3 flex justify-between items-center">';
+                    listHtml += '<span class="text-yellow-400 font-bold text-xl">$' + p.quota + '</span>';
+                    listHtml += '<span class="bg-yellow-500 text-black px-3 py-1 rounded-lg font-bold">x' + p.count + '</span>';
                     listHtml += '</div>';
                 });
                 list.innerHTML = listHtml;
@@ -1556,32 +1556,45 @@ CLAIM_PAGE = '''<!DOCTYPE html>
         
         if(d.claim_mode === 'B'){
             modeBadge.textContent='🔄 自动充值';
-            modeBadge.className='px-2 py-0.5 rounded text-xs bg-green-900/50 text-green-400 border border-green-700';
+            modeBadge.className='badge bg-green-900/50 text-green-400 border border-green-600';
         }else{
             modeBadge.textContent='📝 返回兑换码';
-            modeBadge.className='px-2 py-0.5 rounded text-xs bg-blue-900/50 text-blue-400 border border-blue-700';
+            modeBadge.className='badge bg-blue-900/50 text-blue-400 border border-blue-600';
         }
         
         if(d.can_claim){
             btn.disabled=false;
             badge.textContent='✅ 可领取';
-            badge.className='px-2 py-0.5 rounded text-xs bg-green-900/50 text-green-400 border border-green-700';
+            badge.className='badge bg-green-900/50 text-green-400 border border-green-600';
             msg.textContent='';
         }else{
             btn.disabled=true;
             badge.textContent='⏳ 冷却中';
-            badge.className='px-2 py-0.5 rounded text-xs bg-yellow-900/50 text-yellow-400 border border-yellow-700';
+            badge.className='badge bg-yellow-900/50 text-yellow-400 border border-yellow-600';
             msg.textContent=d.cooldown_text||'';
         }
         
         var h=document.getElementById('hist');
         if(!d.history||d.history.length===0){
-            h.innerHTML='<p class="text-gray-500 text-center text-sm">暂无记录</p>';
+            h.innerHTML='<p class="text-gray-500 text-center py-8">暂无领取记录</p>';
         }else{
             var html='';
             d.history.forEach(r=>{
-                var statusText=r.auto_redeemed?'<span class="text-green-400 text-xs ml-1">[已充值]</span>':'';
-                html+='<div class="cpn text-white text-sm"><div class="flex justify-between items-center"><span class="font-mono text-xs truncate flex-1 mr-2">'+r.coupon_code+'</span><span class="bg-white/20 px-2 py-0.5 rounded text-xs shrink-0">$'+r.quota+'</span></div><div class="flex justify-between items-center mt-1"><span class="text-xs text-blue-200">'+new Date(r.claim_time).toLocaleString('zh-CN')+'</span>'+statusText+'</div></div>';
+                var statusHtml = r.auto_redeemed 
+                    ? '<span class="text-green-400 text-xs bg-green-900/30 px-2 py-1 rounded">✅ 已充值</span>'
+                    : '<span class="text-blue-400 text-xs bg-blue-900/30 px-2 py-1 rounded">📝 兑换码</span>';
+                html+='<div class="record-item">';
+                html+='<div class="flex justify-between items-center">';
+                html+='<div class="flex-1">';
+                if(!r.auto_redeemed){
+                    html+='<div class="font-mono text-sm text-gray-300 truncate mb-1">'+r.coupon_code+'</div>';
+                }
+                html+='<div class="text-xs text-gray-500">'+new Date(r.claim_time).toLocaleString('zh-CN')+'</div>';
+                html+='</div>';
+                html+='<div class="flex items-center gap-3">';
+                html+='<span class="text-xl font-bold text-green-400">$'+r.quota+'</span>';
+                html+=statusHtml;
+                html+='</div></div></div>';
             });
             h.innerHTML=html;
         }
@@ -1614,16 +1627,16 @@ CLAIM_PAGE = '''<!DOCTYPE html>
             if(ok&&data.success){
                 var d=data.data;
                 document.getElementById('prizeAmount').textContent='$'+d.quota;
-                document.getElementById('prizeCode').textContent=d.coupon_code;
                 document.getElementById('prizeBox').style.display='block';
                 
                 if(d.auto_redeemed){
-                    document.getElementById('autoRedeemMsg').style.display='block';
+                    document.getElementById('autoRedeemMsg').style.display='inline-block';
                     document.getElementById('manualRedeemBox').style.display='none';
                     toast('恭喜获得 $'+d.quota+'！已自动充值',true);
                 }else{
                     document.getElementById('autoRedeemMsg').style.display='none';
                     document.getElementById('manualRedeemBox').style.display='block';
+                    document.getElementById('prizeCode').textContent=d.coupon_code;
                     navigator.clipboard.writeText(d.coupon_code).catch(()=>{});
                     toast('恭喜获得 $'+d.quota+'！兑换码已复制',true);
                 }
@@ -2077,6 +2090,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
