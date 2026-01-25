@@ -240,30 +240,12 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
     
     try:
         import base64
-        from urllib.parse import unquote
         
-        # 打印原始值用于调试
-        print(f"[AUTH] 原始 session 长度: {len(session_cookie)}")
-        print(f"[AUTH] 原始 session 前100字符: {session_cookie[:100]}")
-        
-        # 尝试 URL 解码
-        session_cookie = unquote(session_cookie)
-        print(f"[AUTH] URL解码后前100字符: {session_cookie[:100]}")
-        
-        # Gorilla session 格式: base64(timestamp)|base64(gob_data)|signature
-        parts = session_cookie.split("|")
-        print(f"[AUTH] 分割后 parts 数量: {len(parts)}")
-        
-        if len(parts) < 2:
-            print("[AUTH] Session 格式错误，缺少分隔符")
-            return None
-        
-        # 解码第二部分（gob 编码的数据）
-        data_part = parts[1]
+        # 直接 base64 解码整个 session
         decoded = None
         for suffix in ['', '=', '==', '===']:
             try:
-                decoded = base64.urlsafe_b64decode(data_part + suffix)
+                decoded = base64.urlsafe_b64decode(session_cookie + suffix)
                 break
             except:
                 continue
@@ -272,13 +254,15 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
             print("[AUTH] Base64 解码失败")
             return None
         
+        print(f"[AUTH] 解码成功，长度: {len(decoded)}")
+        
         # 查找 id 字段
         idx = decoded.find(b'id')
         if idx == -1:
             print("[AUTH] 未找到 id 字段")
             return None
         
-        # 在 id 后面查找 \x04\x02\x00 模式（gob int 编码标记）
+        # 在 id 后面查找 \x04\x02\x00 模式
         search_area = decoded[idx:idx+30]
         marker_idx = search_area.find(b'\x04\x02\x00')
         
@@ -290,13 +274,12 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
         raw_value = search_area[marker_idx + 3]
         user_id = raw_value // 2
         
-        print(f"[AUTH] 解析成功 - 原始值: {raw_value}, user_id: {user_id}")
+        print(f"[AUTH] user_id: {user_id}")
         
         if user_id <= 0:
-            print("[AUTH] user_id 无效")
             return None
         
-        # 用管理员令牌获取用户完整信息
+        # 用管理员令牌获取用户信息
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{NEW_API_URL}/api/user/{user_id}",
@@ -305,8 +288,6 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
                     "New-Api-User": str(ADMIN_USER_ID)
                 }
             )
-            
-            print(f"[AUTH] API 响应状态: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
@@ -322,8 +303,6 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
         
     except Exception as e:
         print(f"[AUTH] 异常: {e}")
-        import traceback
-        traceback.print_exc()
         return None
 
 async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> str | None:
@@ -2071,6 +2050,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
