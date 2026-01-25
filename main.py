@@ -364,28 +364,31 @@ async def create_redemption_code_via_api(quota_dollars: float, db: Session) -> s
         print(f"创建兑换码异常: {e}")
         return None
 
-async def topup_user_by_session(main_session: str, redemption_code: str) -> bool:
-    """使用主站 session 为用户充值"""
-    if not main_session:
+async def topup_user_by_admin(user_id: int, redemption_code: str) -> bool:
+    """使用管理员令牌为用户充值"""
+    if not ADMIN_ACCESS_TOKEN or not user_id:
         return False
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
-                f"{NEW_API_URL}/api/user/topup",
-                cookies={"session": main_session},
-                headers={"Content-Type": "application/json"},
-                json={"key": redemption_code}
+                f"{NEW_API_URL}/api/topup",
+                headers={
+                    "Authorization": f"Bearer {ADMIN_ACCESS_TOKEN}",
+                    "New-Api-User": str(ADMIN_USER_ID),
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "user_id": user_id,
+                    "key": redemption_code
+                }
             )
-            if response.status_code != 200:
-                print(f"充值失败: HTTP {response.status_code}")
-                return False
-            result = response.json()
-            if not result.get("success"):
-                print(f"充值失败: {result}")
-                return False
-            return True
+            print(f"[TOPUP] 响应: {response.status_code} - {response.text[:200]}")
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("success", False)
+            return False
     except Exception as e:
-        print(f"充值异常: {e}")
+        print(f"[TOPUP] 异常: {e}")
         return False
 
 def get_stock_key(quota_stock: dict, quota: float) -> str:
@@ -784,7 +787,7 @@ async def claim_coupon(request: Request, db: Session = Depends(get_db)):
             db.add(new_coupon)
             
             # B模式自动充值
-            if main_session and await topup_user_by_session(main_session, coupon_code):
+            if await topup_user_by_admin(user_id, coupon_code):
                 auto_redeemed = True
     
     if not coupon_code:
@@ -2074,6 +2077,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
