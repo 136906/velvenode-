@@ -241,7 +241,6 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
     try:
         import base64
         
-        # 直接 base64 解码整个 session
         decoded = None
         for suffix in ['', '=', '==', '===']:
             try:
@@ -255,9 +254,13 @@ async def verify_user_by_main_session(session_cookie: str) -> dict | None:
             return None
         
         print(f"[AUTH] 解码成功，长度: {len(decoded)}")
+        print(f"[AUTH] 解码内容 hex: {decoded.hex()}")
+        print(f"[AUTH] 解码内容 repr: {repr(decoded)}")
         
         # 查找 id 字段
         idx = decoded.find(b'id')
+        print(f"[AUTH] 'id' 位置: {idx}")
+        
         if idx == -1:
             print("[AUTH] 未找到 id 字段")
             return None
@@ -2050,6 +2053,7 @@ ADMIN_PAGE = '''<!DOCTYPE html>
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
